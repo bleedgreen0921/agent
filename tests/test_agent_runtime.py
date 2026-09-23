@@ -1,5 +1,8 @@
 import hashlib
+import json
 import os
+import sys
+import types
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
@@ -9,8 +12,12 @@ from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
+from langchain.tools import ToolRuntime, tool
 
 from agent_service import execution
+from agent_service.rag_client import RagError
+from agent_service.tools import rag as rag_tools
+from agent_service.tooling import ToolExecutionContext
 from agent_service.app import app
 from agent_service.runs import cancel_run, get_run
 from agent_service.runtime import (
@@ -23,7 +30,7 @@ from agent_service.runtime import (
     settle_model,
     settle_tool,
 )
-from contracts.v1 import Evidence, EvidenceSearchResponse, SourceLocator
+from contracts.v1 import ErrorCode, Evidence, EvidenceSearchResponse, SourceLocator
 from db.connection import connect
 from identity.security import new_key
 
@@ -112,6 +119,20 @@ class InvalidPlanModel(ScriptedModel):
         return super().with_structured_output(schema, **kwargs)
 
 
+seen_tool_context: list[tuple[UUID | None, UUID]] = []
+
+
+@tool
+def echo_value(value: str, runtime: ToolRuntime[ToolExecutionContext]) -> str:
+    """Return a value for tool-provider integration testing."""
+    seen_tool_context.append((runtime.context.team_id, runtime.context.run_id))
+    return "echo:" + value
+
+
+def extra_tools():
+    return [echo_value]
+
+
 class FakeRagClient:
     class Client:
         def close(self):
@@ -131,6 +152,11 @@ class FakeRagClient:
             rank=1,
         )
         return EvidenceSearchResponse(request_id="rag-1", retrieval_id="ret-1", status="ok", evidences=[evidence], degradations=[])
+
+
+class UnauthorizedRagClient(FakeRagClient):
+    def search(self, _run_id, _tool_call_id, _request):
+        raise RagError(401, ErrorCode.UNAUTHENTICATED)
 
 
 def test_run_api_idempotency_isolation_cancel_and_trace():
@@ -260,7 +286,7 @@ def test_react_tool_execution_and_citation_snapshot(monkeypatch):
         AIMessage(content="Evidence was found."),
     ]
     monkeypatch.setattr(execution, "model", lambda: EvidenceModel(responses=messages))
-    monkeypatch.setattr(execution, "RagClient", FakeRagClient)
+    monkeypatch.setattr(rag_tools, "RagClient", FakeRagClient)
     team_id, _ = credential()
     run_id = insert_run(team_id, created_delta=timedelta(days=-1))
     claimed = claim_run()
@@ -274,6 +300,26 @@ def test_react_tool_execution_and_citation_snapshot(monkeypatch):
     assert tool_call["retrieval_id"] == "ret-1"
     assert tool_call["evidence_ids"] == ["ev-tool"]
     assert tool_call["triggering_model_call_id"] is not None
+
+
+def test_fatal_tool_auth_error_terminates_run(monkeypatch):
+    quiesce_runs()
+    monkeypatch.setenv("AGENT_MODEL", "scripted")
+    monkeypatch.setenv("RAG_BASE_URL", "http://rag.test")
+    monkeypatch.setenv("RAG_SERVICE_TOKEN", "service-token")
+    messages = [AIMessage(content="", tool_calls=[{"name": "search_evidence", "args": {"query": "retention"}, "id": "tool-auth", "type": "tool_call"}])]
+    monkeypatch.setattr(execution, "model", lambda: ScriptedModel(responses=messages))
+    monkeypatch.setattr(rag_tools, "RagClient", UnauthorizedRagClient)
+    team_id, _ = credential()
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    claimed = claim_run()
+    execution.execute_run(run_id, claimed["lease_token"])
+    result = get_run(run_id, team_id)
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "AUTH_FAILED"
+    with connect("AGENT_DATABASE_URL") as conn:
+        call = conn.execute("SELECT status,error_code FROM agent.tool_calls WHERE run_id=%s", (run_id,)).fetchone()
+    assert call == {"status": "failed", "error_code": "UNAUTHENTICATED"}
 
 
 def test_invalid_plan_has_stable_failure_code(monkeypatch):
@@ -307,3 +353,30 @@ def test_global_concurrency_slots_are_atomic(monkeypatch):
         assert running == 2
     finally:
         quiesce_runs()
+
+
+def test_non_rag_tool_provider_runs_without_execution_changes(monkeypatch):
+    quiesce_runs()
+    seen_tool_context.clear()
+    provider = types.ModuleType("test_extra_tool_provider")
+    provider.tools = extra_tools
+    monkeypatch.setitem(sys.modules, provider.__name__, provider)
+    monkeypatch.setenv("AGENT_TOOL_PROVIDERS", provider.__name__ + ":tools")
+    monkeypatch.setenv("AGENT_MODEL", "scripted")
+    messages = [
+        AIMessage(content="", tool_calls=[{"name": "echo_value", "args": {"value": "hello"}, "id": "extra-1", "type": "tool_call"}]),
+        AIMessage(content="The extra tool returned its value."),
+    ]
+    monkeypatch.setattr(execution, "model", lambda: ScriptedModel(responses=messages))
+    team_id, _ = credential()
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    claimed = claim_run()
+    execution.execute_run(run_id, claimed["lease_token"])
+    assert get_run(run_id, team_id)["status"] == "completed"
+    with connect("AGENT_DATABASE_URL") as conn:
+        call = conn.execute("SELECT tool_name,status,argument_summary FROM agent.tool_calls WHERE run_id=%s", (run_id,)).fetchone()
+    assert call["tool_name"] == "echo_value"
+    assert call["status"] == "succeeded"
+    assert call["argument_summary"]["argument_names"] == ["value"]
+    assert "hello" not in json.dumps(call["argument_summary"])
+    assert seen_tool_context == [(team_id, run_id)]

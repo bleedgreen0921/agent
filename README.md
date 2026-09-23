@@ -1,6 +1,6 @@
 # Research Agent Platform
 
-本仓库是独立 Git 仓库。当前实现身份、三 schema、RAG 文档处理与证据检索，以及异步 Agent Run。Agent 支持 ReAct 和固定 Plan-and-Execute 两种模式；RAG 只返回证据，最终报告由 Agent 生成。
+本仓库是独立 Git 仓库。Agent 是任务规划、工具选择和结果生成的执行主体，支持 ReAct 和固定 Plan-and-Execute 两种模式。RAG 作为当前默认工具提供者独立处理文档与证据检索，只返回证据；服务端工具注册表可以继续接入非 RAG 工具。身份、RAG 和 Agent 数据分别位于三个 schema。
 
 ## 环境
 
@@ -32,6 +32,7 @@ python3.12 -m venv .venv
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | 首次认领后的总墙钟期限，默认 300 秒；模型与工具等待均计入，单次外部调用不另设超时 |
 | `AGENT_MAX_CONCURRENT_RUNS` | 所有父 Worker 共用的数据库全局并发上限，默认 2 |
 | `AGENT_LEASE_SECONDS` / `AGENT_HEARTBEAT_SECONDS` | 执行租约与父 Worker 心跳周期，默认 120/30 秒 |
+| `AGENT_TOOL_PROVIDERS` | Worker 启用的服务端工具提供者，逗号分隔的 `module:factory`；默认只加载 RAG 证据工具 |
 
 DSN 例：`postgresql://role:password@127.0.0.1:5432/research_agent`。各运行角色需不同密码，且不能使用 owner DSN。把秘密放在进程环境或受控秘密管理系统中，不提交 `.env`。生成服务秘密可用：
 
@@ -122,6 +123,8 @@ curl -X POST http://127.0.0.1:8002/v1/runs/RUN_UUID/cancel -H "Authorization: Be
 ```
 
 RAG 零命中和临时不可用会成为结果通知；身份、ACL 和配额错误会使 Run 失败。发布结果时仅保存最终 claim 实际引用的证据快照。报告发布后，原团队仍可通过 Run ID 读取快照，即使原资料后来更新、撤权或逻辑删除。
+
+Agent 核心通过服务端工具提供者注册表加载工具，并对所有工具统一执行身份上下文注入、预算预留和调用 trace。RAG 是当前默认加载的证据工具提供者；新增工具不需要修改 Agent 图执行器。扩展约定和示例见 [Agent 工具扩展接口](docs/tool-providers.md)。
 
 ## 启动与验证
 
