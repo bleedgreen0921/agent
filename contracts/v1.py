@@ -10,6 +10,7 @@ class StrictModel(BaseModel):
 
 
 class ErrorCode(StrEnum):
+    INTERNAL_ERROR = "INTERNAL_ERROR"
     UNAUTHENTICATED = "UNAUTHENTICATED"
     FORBIDDEN = "FORBIDDEN"
     NOT_FOUND = "NOT_FOUND"
@@ -80,6 +81,29 @@ class EvidenceSearchResponse(BaseModel):
     status: Literal["ok", "no_hits", "degraded"]
     evidences: list[Evidence]
     degradations: list[str]
+
+
+class DocumentVersionRef(StrictModel):
+    document_id: str
+    document_version_id: str
+    status: Literal["pending", "processing", "active", "superseded", "failed"]
+
+
+class DocumentVersionStatus(DocumentVersionRef):
+    attempts: int = Field(ge=0)
+    error_code: str | None
+    warnings: list[str]
+
+
+class DocumentAccess(StrictModel):
+    document_id: str
+    visibility: Literal["public", "restricted"]
+    team_ids: list[str]
+
+
+class DocumentDeleted(StrictModel):
+    document_id: str
+    deleted_at: datetime
 
 
 class Claim(StrictModel):

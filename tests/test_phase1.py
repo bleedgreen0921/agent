@@ -6,11 +6,13 @@ from uuid import uuid4
 import httpx
 import psycopg
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agent_service.app import app as agent_app
 from agent_service.rag_client import RagClient, RagError
-from contracts.v1 import ErrorCode, ErrorResponse, EvidenceSearchRequest, EvidenceSearchResponse, RunCreate
+from contracts.v1 import ErrorCode, ErrorResponse, EvidenceSearchRequest, RunCreate
+from contracts.errors import install_errors
 from db.connection import connect
 from identity.security import agent_team, new_key, rag_team, verify
 from rag_service.app import app as rag_app
@@ -27,7 +29,7 @@ def test_contracts_and_health():
     with TestClient(rag_app) as rag, TestClient(agent_app) as agent:
         assert rag.get("/health").json() == {"status": "ok", "service": "rag"}
         assert agent.get("/health").json() == {"status": "ok", "service": "agent"}
-        assert rag.post("/v1/evidence/search").status_code == 404
+        assert rag.post("/v1/evidence/search").status_code == 401
         assert agent.post("/v1/runs").status_code == 404
         response = rag.post("/v1/admin/teams", json={"name": "x"})
         assert response.status_code == 401
@@ -41,10 +43,25 @@ def test_service_bearer_is_separate(monkeypatch):
         require_service("Bearer key_abc.secret")
 
 
+def test_unhandled_error_is_sanitized():
+    probe = FastAPI()
+    install_errors(probe)
+
+    @probe.get("/fail")
+    def fail():
+        raise RuntimeError("secret diagnostic")
+
+    with TestClient(probe, raise_server_exceptions=False) as client:
+        response = client.get("/fail")
+    assert response.status_code == 500
+    assert response.json()["error"] == {"code": "INTERNAL_ERROR", "message": "Internal server error"}
+    assert "secret diagnostic" not in response.text
+
+
 @pytest.mark.skipif(not os.environ.get("IDENTITY_ADMIN_DATABASE_URL"), reason="isolated PostgreSQL not configured")
 def test_migrations_permissions_and_key_lifecycle():
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
-        for schema, version in (("identity", "identity_0001"), ("rag", "rag_0001"), ("agent", "agent_0001")):
+        for schema, version in (("identity", "identity_0001"), ("rag", "rag_0002"), ("agent", "agent_0001")):
             assert conn.execute(f"SELECT version_num FROM {schema}.alembic_version").fetchone()[0] == version
         assert conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
     with connect("RAG_DATABASE_URL") as conn:

@@ -7,7 +7,7 @@ from pydantic import Field
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode, StrictModel
 from db.connection import connect
-from identity.security import Principal, admin, new_key
+from identity.security import admin, new_key
 
 
 router = APIRouter(prefix="/v1/admin", tags=["identity"], dependencies=[Depends(admin)])

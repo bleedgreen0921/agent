@@ -27,6 +27,8 @@ def main() -> None:
             else:
                 conn.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(sql.Identifier(role), sql.Literal(password)))
         conn.execute("REVOKE ALL ON SCHEMA public FROM PUBLIC")
+        # pgvector is installed in public; only RAG needs to resolve its type/operators.
+        conn.execute("GRANT USAGE ON SCHEMA public TO rag_runtime")
         for schema in ("identity", "rag", "agent"):
             conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
             conn.execute(sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(sql.Identifier(schema)))
