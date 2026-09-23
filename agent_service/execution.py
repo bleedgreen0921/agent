@@ -1,6 +1,7 @@
-import json
-import os
 import hashlib
+import json
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Annotated, Literal, TypedDict
 from uuid import UUID, uuid4
@@ -19,6 +20,9 @@ from agent_service.rag_client import RagClient, RagError
 from agent_service.runtime import BudgetExhausted, fail_run, publish_result, reserve_model, reserve_tool, settle_model, settle_tool
 from contracts.v1 import ErrorCode, EvidenceSearchRequest
 from db.connection import connect
+
+
+log = logging.getLogger(__name__)
 
 
 class Strict(BaseModel):
@@ -303,4 +307,5 @@ def execute_run(run_id: UUID, token: UUID) -> None:
     except (PermissionError,):
         return
     except Exception:
+        log.exception("Agent run execution failed", extra={"run_id": str(run_id)})
         fail_run(run_id, token, "MODEL_CALL_FAILED")

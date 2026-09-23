@@ -1,5 +1,6 @@
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -288,3 +289,21 @@ def test_invalid_plan_has_stable_failure_code(monkeypatch):
     result = get_run(run_id, team_id)
     assert result["status"] == "failed"
     assert result["error"]["code"] == "INVALID_PLAN"
+
+
+def test_global_concurrency_slots_are_atomic(monkeypatch):
+    quiesce_runs()
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT_RUNS", "2")
+    team_id, _ = credential()
+    run_ids = {insert_run(team_id, created_delta=timedelta(days=-1, seconds=index)) for index in range(4)}
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            claims = [claim for claim in pool.map(lambda _: claim_run(), range(4)) if claim]
+        assert len(claims) == 2
+        assert len({claim["run_id"] for claim in claims}) == 2
+        assert {claim["run_id"] for claim in claims} <= run_ids
+        with connect("AGENT_DATABASE_URL") as conn:
+            running = conn.execute("SELECT count(*) AS n FROM agent.agent_runs WHERE id=ANY(%s) AND status='running'", (list(run_ids),)).fetchone()["n"]
+        assert running == 2
+    finally:
+        quiesce_runs()
