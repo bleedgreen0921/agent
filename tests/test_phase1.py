@@ -30,7 +30,7 @@ def test_contracts_and_health():
         assert rag.get("/health").json() == {"status": "ok", "service": "rag"}
         assert agent.get("/health").json() == {"status": "ok", "service": "agent"}
         assert rag.post("/v1/evidence/search").status_code == 401
-        assert agent.post("/v1/runs").status_code == 404
+        assert agent.post("/v1/runs").status_code == 401
         response = rag.post("/v1/admin/teams", json={"name": "x"})
         assert response.status_code == 401
         assert ErrorResponse.model_validate(response.json()).error.code == ErrorCode.UNAUTHENTICATED
@@ -61,7 +61,7 @@ def test_unhandled_error_is_sanitized():
 @pytest.mark.skipif(not os.environ.get("IDENTITY_ADMIN_DATABASE_URL"), reason="isolated PostgreSQL not configured")
 def test_migrations_permissions_and_key_lifecycle():
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
-        for schema, version in (("identity", "identity_0001"), ("rag", "rag_0002"), ("agent", "agent_0001")):
+        for schema, version in (("identity", "identity_0001"), ("rag", "rag_0002"), ("agent", "agent_0002")):
             assert conn.execute(f"SELECT version_num FROM {schema}.alembic_version").fetchone()[0] == version
         assert conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
     with connect("RAG_DATABASE_URL") as conn:
@@ -73,10 +73,10 @@ def test_migrations_permissions_and_key_lifecycle():
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("INSERT INTO identity.teams(id, name) VALUES (%s, 'forbidden')", (uuid4(),))
     with connect("AGENT_DATABASE_URL") as conn:
-        assert conn.execute("SELECT count(*) AS n FROM agent.runs").fetchone()["n"] >= 0
+        assert conn.execute("SELECT count(*) AS n FROM agent.agent_runs").fetchone()["n"] >= 0
         run_id = uuid4()
-        conn.execute("INSERT INTO agent.runs(id,team_id,key_id,task,mode) VALUES (%s,%s,'probe','probe','react')", (run_id, uuid4()))
-        conn.execute("DELETE FROM agent.runs WHERE id=%s", (run_id,))
+        conn.execute("INSERT INTO agent.agent_runs(id,team_id,key_id,task,mode,request_digest,queue_deadline_at) VALUES (%s,%s,'probe','probe','react',decode(repeat('00',32),'hex'),now()+interval '1 minute')", (run_id, uuid4()))
+        conn.execute("DELETE FROM agent.agent_runs WHERE id=%s", (run_id,))
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("SELECT * FROM rag.documents")
     with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
@@ -125,7 +125,7 @@ def test_rag_http_adapter_uses_persisted_team():
     with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
         conn.execute("INSERT INTO identity.teams(id,name) VALUES (%s,%s)", (team_id, "adapter-" + uuid4().hex))
     with connect("AGENT_DATABASE_URL") as conn:
-        conn.execute("INSERT INTO agent.runs(id,team_id,key_id,task,mode) VALUES (%s,%s,'key_test','task','react')", (run_id, team_id))
+        conn.execute("INSERT INTO agent.agent_runs(id,team_id,key_id,task,mode,request_digest,queue_deadline_at) VALUES (%s,%s,'key_test','task','react',decode(repeat('00',32),'hex'),now()+interval '1 minute')", (run_id, team_id))
     def handler(request):
         assert request.headers["Authorization"] == "Bearer service-secret"
         assert request.headers["X-Team-Id"] == str(team_id)
@@ -136,6 +136,12 @@ def test_rag_http_adapter_uses_persisted_team():
         return httpx.Response(200, json={"request_id": "rag_req_1", "retrieval_id": "ret_1", "status": "no_hits", "evidences": [], "degradations": [], "new_field": 1})
     client = RagClient("http://rag.test", "service-secret", httpx.Client(transport=httpx.MockTransport(handler)))
     assert client.search(run_id, "call_1", EvidenceSearchRequest(query="hello")).status == "no_hits"
+    def read_handler(request):
+        assert request.url.path == "/v1/evidence/ev_1"
+        assert request.headers["X-Team-Id"] == str(team_id)
+        return httpx.Response(200, json={"evidence_id": "ev_1", "document_id": "doc_1", "document_version_id": "ver_1", "title": "Title", "content": "Text", "source_locator": {"kind": "txt", "line_start": 1, "line_end": 1}})
+    client.client = httpx.Client(transport=httpx.MockTransport(read_handler))
+    assert client.read(run_id, "call_2", "ev_1").content == "Text"
     def error_handler(request):
         return httpx.Response(503, json={"error": {"code": "RAG_UNAVAILABLE", "message": "Unavailable"}, "request_id": "req_1"})
     client.client = httpx.Client(transport=httpx.MockTransport(error_handler))

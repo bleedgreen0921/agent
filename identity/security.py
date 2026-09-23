@@ -56,3 +56,7 @@ def agent_team(authorization: str | None = Header(default=None)) -> Principal:
 
 def admin(authorization: str | None = Header(default=None)) -> Principal:
     return verify(authorization, "admin", "RAG_DATABASE_URL")
+
+
+def agent_admin(authorization: str | None = Header(default=None)) -> Principal:
+    return verify(authorization, "admin", "AGENT_DATABASE_URL")

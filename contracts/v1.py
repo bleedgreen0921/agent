@@ -25,6 +25,7 @@ class ErrorCode(StrEnum):
     AUTH_FAILED = "AUTH_FAILED"
     ACCESS_DENIED = "ACCESS_DENIED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    INTERRUPTED_UNKNOWN = "INTERRUPTED_UNKNOWN"
 
 
 class ErrorDetail(StrictModel):
@@ -42,9 +43,12 @@ class RunCreate(StrictModel):
     mode: Literal["react", "plan_execute"] = "react"
 
 
+RunStatus = Literal["queued", "running", "cancelling", "completed", "partial", "failed", "cancelled"]
+
+
 class RunAccepted(StrictModel):
     run_id: str
-    status: str
+    status: RunStatus
     created_at: datetime
 
 
@@ -123,7 +127,7 @@ class Result(StrictModel):
 class RunResponse(StrictModel):
     run_id: str
     mode: Literal["react", "plan_execute"]
-    status: Literal["queued", "running", "cancelling", "completed", "partial", "failed", "cancelled"]
+    status: RunStatus
     created_at: datetime
     finished_at: datetime | None = None
     result: Result | None = None
