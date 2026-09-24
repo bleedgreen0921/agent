@@ -1,0 +1,51 @@
+name: PostgreSQL integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: research_agent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d research_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/research_agent
+      RAG_DATABASE_URL: postgresql://rag_runtime:rag-runtime-ci@127.0.0.1:5432/research_agent
+      AGENT_DATABASE_URL: postgresql://agent_runtime:agent-runtime-ci@127.0.0.1:5432/research_agent
+      IDENTITY_ADMIN_DATABASE_URL: postgresql://identity_admin:identity-admin-ci@127.0.0.1:5432/research_agent
+      RAG_SERVICE_TOKEN: ci-only-service-token-with-at-least-32-bytes
+      RAG_FILES_DIR: ${{ runner.temp }}/rag-files
+      APP_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install locked dependencies
+        run: python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.lock
+      - name: Migrate schemas
+        run: python -m db.migrate
+      - name: Initialize checkpoints
+        run: python -m agent_service.checkpoints
+      - name: Bootstrap least-privilege roles
+        run: python -m db.bootstrap
+      - name: Diagnose database
+        run: python -m db.doctor --json
+      - name: Run tests
+        run: pytest -q -rs
