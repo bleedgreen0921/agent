@@ -266,6 +266,12 @@ def test_run_api_idempotency_isolation_cancel_and_trace():
         assert trace.status_code == 200
         assert trace.json()["run"]["team_id"] == str(team1)
         assert client.get(f"/v1/admin/runs/{run_id}/trace", headers={"Authorization": "Bearer " + key1}).status_code == 401
+        timeline = client.get(f"/v1/admin/runs/{run_id}/timeline", headers={"Authorization": "Bearer " + admin_key})
+        assert timeline.status_code == 200
+        assert timeline.json()["manifest"] is None
+        assert client.get(f"/v1/admin/runs/{run_id}/timeline", headers={"Authorization": "Bearer " + key1}).status_code == 401
+        missing = client.get(f"/v1/admin/runs/{uuid4()}/timeline", headers={"Authorization": "Bearer " + admin_key})
+        assert missing.status_code == 404 and missing.json()["error"]["code"] == "NOT_FOUND"
 
 
 def test_claim_budgets_atomic_result_and_historical_snapshot(monkeypatch):
