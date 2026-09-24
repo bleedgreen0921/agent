@@ -28,6 +28,7 @@ python3.12 -m venv .venv
 | `RAG_MODEL_TIMEOUT_SECONDS` | 模型 HTTP 单次超时，默认 30 秒 |
 | `RAG_BASE_URL` | Agent Worker 使用的 RAG API 根地址 |
 | `AGENT_MODEL_URL` / `AGENT_MODEL` / `AGENT_MODEL_KEY` | OpenAI 兼容 Chat Completions 服务根地址、模型名和 Key；根地址可含或不含 `/v1` |
+| `APP_REVISION` | 可选的部署版本标识；优先写入 Run Execution Manifest，未设置时回退到 Git HEAD，最后使用 `unknown` |
 | `AGENT_QUEUE_TIMEOUT_SECONDS` | Run 排队期限，默认 60 秒 |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | 首次认领后的总墙钟期限，默认 300 秒；模型与工具等待均计入，单次外部调用不另设超时 |
 | `AGENT_MAX_CONCURRENT_RUNS` | 所有父 Worker 共用的数据库全局并发上限，默认 2 |
@@ -54,9 +55,17 @@ docker run -d --name research-agent-test-pg -e POSTGRES_PASSWORD=change-me -e PO
 .venv/bin/python -m db.migrate
 .venv/bin/python -m agent_service.checkpoints
 .venv/bin/python -m db.bootstrap
+.venv/bin/python -m db.doctor
 ```
 
-`db.migrate` 依次运行 `identity`、`rag`、`agent` 三条独立 Alembic 链，各有自己的 `alembic_version`。RAG 链安装 `vector` 扩展。`agent_service.checkpoints` 由数据库 owner 显式建立 LangGraph 恢复表；API 和 Worker 都不会自动建表或迁移。`db.bootstrap` 创建或重置三个运行角色的密码、授权各自业务 schema，并只向 RAG/Agent 账号开放身份表的 `SELECT`；Agent 账号无 RAG schema 使用权，RAG 账号无 Agent schema 使用权。RAG 账号还需对放置 pgvector 的 `public` schema 有 `USAGE`，用于解析向量类型。数据库账号配置应在专用新数据库进行，脚本会收紧 `public` schema 权限。
+`db.migrate` 依次运行 `identity`、`rag`、`agent` 三条独立 Alembic 链，各有自己的 `alembic_version`。RAG 链安装 `vector` 扩展。`agent_service.checkpoints` 由数据库 owner 显式建立 LangGraph 恢复表；API 和 Worker 都不会自动建表或迁移。`db.bootstrap` 创建或重置三个运行角色的密码、授权各自业务 schema，并只向 RAG/Agent 账号开放身份表的 `SELECT`；`agent_runtime` 对 Execution Manifest 只有 `SELECT`、`INSERT`，不能修改或删除。Agent 账号无 RAG schema 使用权，RAG 账号无 Agent schema 使用权。RAG 账号还需对放置 pgvector 的 `public` schema 有 `USAGE`，用于解析向量类型。数据库账号配置应在专用新数据库进行，脚本会收紧 `public` schema 权限。
+
+`db.doctor` 是严格只读的部署诊断：检查配置、四个数据库角色的连接、迁移 head、pgvector、checkpoint、权限隔离、索引 revision/Embedding 覆盖、过期租约、调用一致性和资料文件一致性。默认每项输出一行，`--json` 输出稳定的机器可读结构；只有 PASS/WARN 时退出 0，任一 ERROR 时退出 1。它不创建资料目录，也不提供自动修复：
+
+```sh
+.venv/bin/python -m db.doctor
+.venv/bin/python -m db.doctor --json
+```
 
 首次生成管理凭据：
 
@@ -88,6 +97,8 @@ curl http://127.0.0.1:8001/v1/admin/documents/DOCUMENT_UUID/versions/VERSION_UUI
 
 证据端点仅接受独立服务 Bearer，并要求 Agent 从持久 Run 注入的 `X-Team-Id`、`X-Run-Id`、`X-Tool-Call-Id`。`POST /v1/evidence/search` 请求如 `{"query":"policy retention","top_k":5}`；`GET /v1/evidence/{evidence_id}` 只返回单片段。检索执行 dense 50、FTS 50、RRF 前 40、精排后 top_k；查询 SQL 在候选截断前应用 ACL。两路召回均不可用返回 503；单路或精排临时故障在响应 `degradations` 中标出。当前 pgvector 使用精确距离排序，尚无近似向量索引。
 
+RAG 检索审计记录 operation、关联 ID、原始/改写 query 的 SHA-256、最终 evidence ID 顺序、降级和稳定错误码。它不保存原始 query、向量、完整候选分数或证据正文；迁移前的审计行仅回填 `operation`，无法可靠重建的新字段保持 `NULL`。
+
 另启独立文档 Worker：
 
 ```sh
@@ -116,7 +127,14 @@ curl http://127.0.0.1:8002/v1/runs/RUN_UUID -H "Authorization: Bearer $TEAM_KEY"
 curl -X POST http://127.0.0.1:8002/v1/runs/RUN_UUID/cancel -H "Authorization: Bearer $TEAM_KEY"
 ```
 
-父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。只有已经显式确认写入 LangGraph checkpoint 的调用才允许恢复；失租时若存在结果未知或尚未确认持久化的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
+父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。首次认领与状态变更在同一事务中写入不可变的 Execution Manifest，记录部署 revision、执行图/提示集版本、模型非秘密配置摘要、工具提供者和预算；恢复认领不会覆盖它。Manifest 不保存模型 Key、RAG token 或完整模型 URL。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。只有已经显式确认写入 LangGraph checkpoint 的调用才允许恢复；失租时若存在结果未知或尚未确认持久化的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
+
+管理 Key 可读取原始业务 trace，也可读取安全的确定性时间线。Timeline 只聚合 Agent schema，不在线查询 RAG；`retrieval_id`、`service_request_id` 和 `tool_call_id` 用于离线关联。旧 Run 没有 Manifest 时返回 `manifest: null`，时间线不返回 task、最终 answer、原始 prompt、工具原始参数或证据正文：
+
+```sh
+curl http://127.0.0.1:8002/v1/admin/runs/RUN_UUID/trace -H "Authorization: Bearer $ADMIN_KEY"
+curl http://127.0.0.1:8002/v1/admin/runs/RUN_UUID/timeline -H "Authorization: Bearer $ADMIN_KEY"
+```
 
 ```sh
 .venv/bin/python -m agent_service.worker
@@ -143,5 +161,7 @@ curl http://127.0.0.1:8002/health
 ```
 
 使用专用测试数据库及上述四个 DSN 执行 `.venv/bin/pytest -q`。测试在数据库中创建随机命名团队、凭据、Run 和合成文档；请勿指向生产库。无数据库变量时数据库测试会跳过。Agent 的 RAG 适配器只通过 HTTP/JSON 契约交互，从持久 Run 读取可信团队 ID。React、Plan-and-Execute、checkpoint、预算和结果发布使用脚本化模型验证；真实模型端点以及真实 Embedding、改写和精排服务的效果尚未验证。数据流见 [架构图](docs/architecture.md)。
+
+已有部署升级时必须先升级数据结构，再部署依赖新表和字段的代码：运行 `python -m db.migrate`；新环境再执行 checkpoint setup（已有 checkpoint 表无需重建）；随后重复运行 `python -m db.bootstrap` 收紧 Manifest 权限；确认 `python -m db.doctor` 无 ERROR；最后部署 API 和 Worker。旧代码可继续使用新 schema，新增迁移的 downgrade 只移除 Manifest 与检索审计元数据，不删除核心 Run、结果、文档或证据。
 
 可复现的本地 HTTP Mock 全链路步骤见 [合成资料演示](docs/synthetic-demo.md)。该流程已覆盖受限资料上传、Worker 索引、混合检索、两种 Agent 模式、工具调用和引用快照；Mock 固定输出只用于工程验收，不代表真实检索或模型效果。
