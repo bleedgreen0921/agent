@@ -2,9 +2,9 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Response
 
-from contracts.v1 import RunAccepted, RunCreate, RunResponse
+from contracts.v1 import RunAccepted, RunCreate, RunResponse, RunTimeline
 from identity.security import Principal, agent_admin, agent_team
-from agent_service.runs import cancel_run, create_run, get_run, trace
+from agent_service.runs import cancel_run, create_run, get_run, timeline, trace
 
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
@@ -33,3 +33,8 @@ def cancel(run_id: UUID, response: Response, principal: Principal = Depends(agen
 @admin_router.get("/{run_id}/trace", dependencies=[Depends(agent_admin)])
 def read_trace(run_id: UUID):
     return trace(run_id)
+
+
+@admin_router.get("/{run_id}/timeline", response_model=RunTimeline, dependencies=[Depends(agent_admin)])
+def read_timeline(run_id: UUID):
+    return timeline(run_id)

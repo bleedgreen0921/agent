@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -133,3 +133,42 @@ class RunResponse(StrictModel):
     finished_at: datetime | None = None
     result: Result | None = None
     error: ErrorDetail | None = None
+
+
+TimelineEventType = Literal[
+    "run_created",
+    "manifest_captured",
+    "run_started",
+    "step",
+    "model_call",
+    "tool_call",
+    "result_published",
+    "run_finished",
+]
+
+
+class TimelineManifest(StrictModel):
+    schema_version: int
+    captured_at: datetime
+    data: dict[str, Any]
+
+
+class TimelineEvent(StrictModel):
+    sequence: int
+    event_id: str
+    type: TimelineEventType
+    occurred_at: datetime
+    finished_at: datetime | None = None
+    status: str | None = None
+    entity_id: str | None = None
+    step_id: str | None = None
+    parent_id: str | None = None
+    name: str | None = None
+    details: dict[str, Any]
+
+
+class RunTimeline(StrictModel):
+    run_id: str
+    status: RunStatus
+    manifest: TimelineManifest | None
+    events: list[TimelineEvent]
