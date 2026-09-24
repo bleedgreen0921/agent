@@ -38,24 +38,36 @@ class RagClient:
 
     def search(self, run_id: UUID, tool_call_id: str, request: EvidenceSearchRequest) -> EvidenceSearchResponse:
         context = TrustedRunContext.from_persisted_run(run_id)
-        response = self.client.post(
-            self.base_url + "/v1/evidence/search",
-            headers={"Authorization": "Bearer " + self.service_token, "X-Team-Id": str(context.team_id), "X-Run-Id": str(context.run_id), "X-Tool-Call-Id": tool_call_id},
-            json=request.model_dump(),
-        )
+        try:
+            response = self.client.post(
+                self.base_url + "/v1/evidence/search",
+                headers={"Authorization": "Bearer " + self.service_token, "X-Team-Id": str(context.team_id), "X-Run-Id": str(context.run_id), "X-Tool-Call-Id": tool_call_id},
+                json=request.model_dump(),
+            )
+        except httpx.TransportError as exc:
+            raise RagError(503, ErrorCode.RAG_UNAVAILABLE) from exc
         if response.is_error:
             raise self._error(response)
-        return EvidenceSearchResponse.model_validate(response.json())
+        try:
+            return EvidenceSearchResponse.model_validate(response.json())
+        except (TypeError, ValueError) as exc:
+            raise RagError(502, ErrorCode.RAG_UNAVAILABLE) from exc
 
     def read(self, run_id: UUID, tool_call_id: str, evidence_id: str) -> Evidence:
         context = TrustedRunContext.from_persisted_run(run_id)
-        response = self.client.get(
-            self.base_url + "/v1/evidence/" + evidence_id,
-            headers={"Authorization": "Bearer " + self.service_token, "X-Team-Id": str(context.team_id), "X-Run-Id": str(context.run_id), "X-Tool-Call-Id": tool_call_id},
-        )
+        try:
+            response = self.client.get(
+                self.base_url + "/v1/evidence/" + evidence_id,
+                headers={"Authorization": "Bearer " + self.service_token, "X-Team-Id": str(context.team_id), "X-Run-Id": str(context.run_id), "X-Tool-Call-Id": tool_call_id},
+            )
+        except httpx.TransportError as exc:
+            raise RagError(503, ErrorCode.RAG_UNAVAILABLE) from exc
         if response.is_error:
             raise self._error(response)
-        return Evidence.model_validate(response.json())
+        try:
+            return Evidence.model_validate(response.json())
+        except (TypeError, ValueError) as exc:
+            raise RagError(502, ErrorCode.RAG_UNAVAILABLE) from exc
 
     @staticmethod
     def _error(response: httpx.Response) -> RagError:

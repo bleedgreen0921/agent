@@ -134,7 +134,7 @@ def add_version(document_id: UUID, file: UploadFile, key: str | None, caller_key
             pending = conn.execute("SELECT 1 FROM rag.document_versions WHERE document_id=%s AND status IN ('pending','processing')", (document_id,)).fetchone()
             if pending:
                 raise ApiError(409, ErrorCode.VERSION_IN_PROGRESS, "Version in progress")
-            same = conn.execute("SELECT id,status FROM rag.document_versions WHERE document_id=%s AND file_sha256=%s AND status IN ('active','superseded') ORDER BY version_number DESC LIMIT 1", (document_id, digest)).fetchone()
+            same = conn.execute("SELECT id,status FROM rag.document_versions WHERE document_id=%s AND file_sha256=%s AND media_type=%s AND status IN ('active','superseded') ORDER BY version_number DESC LIMIT 1", (document_id, digest, media_type)).fetchone()
             if same:
                 if key:
                     conn.execute("""INSERT INTO rag.upload_keys(caller_key_id,scope,document_id,key,request_digest,version_id)

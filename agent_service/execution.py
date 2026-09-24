@@ -14,8 +14,8 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_service.checkpoints import with_agent_search_path
-from agent_service.runtime import BudgetExhausted, fail_run, publish_result, reserve_model, settle_model
-from agent_service.tooling import FatalToolError, ToolExecutionContext, budgeted_tool, load_tools
+from agent_service.runtime import BudgetExhausted, fail_run, mark_checkpointed_calls, publish_result, reserve_model, settle_model
+from agent_service.tooling import FatalToolError, ToolCallFailed, ToolExecutionContext, budgeted_tool, load_tools
 from db.connection import connect
 
 
@@ -178,6 +178,8 @@ def run_plan(run_id: UUID, token: UUID, team_id: UUID, key_id: str, task: str, s
         return {"steps": steps, "index": 0}
 
     def execute_node(state: PlanState):
+        if not mark_checkpointed_calls(run_id, token):
+            raise PermissionError("execution lease was revoked")
         index = state["index"]
         step = state["steps"][index]
         with connect("AGENT_DATABASE_URL") as conn:
@@ -192,10 +194,20 @@ def run_plan(run_id: UUID, token: UUID, team_id: UUID, key_id: str, task: str, s
             evidence=dict(state.get("evidence", {})),
             notices=list(state.get("notices", [])),
         )
-        prompt = f"Original task: {state['task']}\nCurrent step goal: {step['goal']}\nCompletion condition: {step['completion_condition']}"
+        prompt = json.dumps(
+            {
+                "original_task": state["task"],
+                "current_step": step,
+                "prior_step_summaries": state.get("summaries", []),
+                "available_evidence": list(state.get("evidence", {}).values()),
+            },
+            ensure_ascii=False,
+        )
         config = {"configurable": {"thread_id": f"{run_id}:step:{index + 1}"}, "recursion_limit": 64}
         snapshot = agent.get_state(config)
         output = agent.invoke(None if snapshot.values else {"messages": [{"role": "user", "content": prompt}]}, config=config, context=context)
+        if not mark_checkpointed_calls(run_id, token):
+            raise PermissionError("execution lease was revoked")
         collect_evidence(output["messages"], context.evidence)
         summary = str(output["messages"][-1].content)
         safe_summary = f"sha256={hashlib.sha256(summary.encode()).hexdigest()}; characters={len(summary)}"
@@ -212,7 +224,16 @@ def run_plan(run_id: UUID, token: UUID, team_id: UUID, key_id: str, task: str, s
     compiled = graph.compile(checkpointer=saver)
     config = {"configurable": {"thread_id": str(run_id)}, "recursion_limit": 64}
     snapshot = compiled.get_state(config)
-    result = compiled.invoke(None if snapshot.values else {"task": task, "steps": [], "index": 0, "summaries": [], "evidence": {}, "notices": []}, config=config)
+    try:
+        result = compiled.invoke(None if snapshot.values else {"task": task, "steps": [], "index": 0, "summaries": [], "evidence": {}, "notices": []}, config=config)
+    except BudgetExhausted:
+        state = dict(compiled.get_state(config).values or {})
+        with connect("AGENT_DATABASE_URL") as conn:
+            conn.execute("""UPDATE agent.run_steps SET status='failed',error_code='QUOTA_EXCEEDED',finished_at=now()
+                WHERE run_id=%s AND status='running'""", (run_id,))
+        return state.get("summaries", []), state.get("evidence", {}), state.get("notices", []), True
+    if not mark_checkpointed_calls(run_id, token):
+        raise PermissionError("execution lease was revoked")
     return result["summaries"], result["evidence"], result["notices"], False
 
 
@@ -230,6 +251,8 @@ def execute_run(run_id: UUID, token: UUID) -> None:
                 config = {"configurable": {"thread_id": str(run_id)}, "recursion_limit": 64}
                 snapshot = agent.get_state(config)
                 output = agent.invoke(None if snapshot.values else {"messages": [{"role": "user", "content": run["task"]}]}, config=config, context=context)
+                if not mark_checkpointed_calls(run_id, token):
+                    raise PermissionError("execution lease was revoked")
                 collect_evidence(output["messages"], context.evidence)
                 summaries = [str(output["messages"][-1].content)]
                 partial = False
@@ -251,6 +274,9 @@ def execute_run(run_id: UUID, token: UUID) -> None:
         fail_run(run_id, token, "MODEL_CALL_FAILED", type(exc).__name__)
     except FatalToolError as exc:
         fail_run(run_id, token, exc.run_code)
+    except ToolCallFailed:
+        log.exception("Agent tool provider failed", extra={"run_id": str(run_id)})
+        fail_run(run_id, token, "TOOL_CALL_FAILED")
     except (PermissionError,):
         return
     except Exception:

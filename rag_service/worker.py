@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+import psycopg
 from psycopg.types.json import Jsonb
 
 from db.connection import connect
@@ -17,6 +18,8 @@ from rag_service.parse import ParseFailure, parse_file
 
 log = logging.getLogger(__name__)
 LEASE_SECONDS = 60
+POLL_SECONDS = 1
+MAX_POLL_BACKOFF_SECONDS = 30
 
 
 def claim() -> dict | None:
@@ -123,6 +126,14 @@ def fail(job: dict, code: str, retryable: bool) -> None:
         conn.execute("UPDATE rag.document_versions SET status=%s,error_code=%s WHERE id=%s", ("pending" if retry else "failed", code, job["version_id"]))
 
 
+def fail_safely(job: dict, code: str, retryable: bool) -> None:
+    try:
+        fail(job, code, retryable)
+    except psycopg.OperationalError:
+        # Leave the job leased; it will be reclaimed after the lease expires.
+        log.exception("Document worker could not record job failure")
+
+
 def run_once() -> bool:
     job = claim()
     if not job:
@@ -133,12 +144,15 @@ def run_once() -> bool:
     try:
         process(job)
     except ParseFailure as exc:
-        fail(job, str(exc), False)
+        fail_safely(job, str(exc), False)
     except ModelFailure as exc:
-        fail(job, exc.code, exc.retryable)
+        fail_safely(job, exc.code, exc.retryable)
+    except psycopg.OperationalError:
+        log.exception("Document processing lost its database connection")
+        fail_safely(job, "DATABASE_UNAVAILABLE", True)
     except Exception:
         log.exception("Document processing failed")
-        fail(job, "PROCESSING_FAILED", False)
+        fail_safely(job, "PROCESSING_FAILED", False)
     finally:
         stop.set()
         thread.join(timeout=2)
@@ -147,9 +161,18 @@ def run_once() -> bool:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    backoff = POLL_SECONDS
     while True:
-        if not run_once():
-            time.sleep(1)
+        try:
+            worked = run_once()
+        except psycopg.OperationalError:
+            log.exception("Document worker polling lost its database connection")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_POLL_BACKOFF_SECONDS)
+            continue
+        backoff = POLL_SECONDS
+        if not worked:
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":

@@ -29,9 +29,12 @@ class SetExpiry(StrictModel):
 def create_team(body: CreateTeam):
     team_id = uuid4()
     with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
-        if conn.execute("SELECT 1 FROM identity.teams WHERE name = %s", (body.name,)).fetchone():
+        row = conn.execute(
+            "INSERT INTO identity.teams(id, name) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING RETURNING id",
+            (team_id, body.name),
+        ).fetchone()
+        if row is None:
             raise ApiError(409, ErrorCode.IDEMPOTENCY_CONFLICT, "Team name already exists")
-        conn.execute("INSERT INTO identity.teams(id, name) VALUES (%s, %s)", (team_id, body.name))
     return {"team_id": str(team_id), "name": body.name}
 
 

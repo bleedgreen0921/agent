@@ -3,6 +3,7 @@ import types
 from pathlib import Path
 
 import httpx
+import pytest
 
 from rag_service.chunking import make_chunks
 from rag_service import models
@@ -99,3 +100,24 @@ def test_model_http_contracts(monkeypatch):
     monkeypatch.setenv("RAG_RERANK_URL", "http://rerank.test")
     monkeypatch.setattr(models, "_client", lambda: httpx.Client(transport=httpx.MockTransport(rerank_handler)))
     assert models.rerank("question", ["low", "high"]) == [1, 0]
+
+
+@pytest.mark.parametrize(
+    ("operation", "env_name", "url", "expected_code"),
+    [
+        (lambda: models.embed(["text"], "embedding-model", 2), "RAG_EMBEDDING_URL", "http://embedding.test", "EMBEDDING_UNAVAILABLE"),
+        (lambda: models.rerank("query", ["text"]), "RAG_RERANK_URL", "http://rerank.test", "RERANK_UNAVAILABLE"),
+    ],
+)
+def test_model_remote_protocol_errors_are_retryable(monkeypatch, operation, env_name, url, expected_code):
+    def handler(request: httpx.Request):
+        raise httpx.RemoteProtocolError("peer disconnected", request=request)
+
+    monkeypatch.setenv(env_name, url)
+    monkeypatch.setattr(models, "_client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(models.ModelFailure) as exc:
+        operation()
+
+    assert exc.value.code == expected_code
+    assert exc.value.retryable is True

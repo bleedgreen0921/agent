@@ -56,6 +56,10 @@ class RecoverableToolError(RuntimeError):
         super().__init__(code)
 
 
+class ToolCallFailed(RuntimeError):
+    pass
+
+
 def load_tools(specification: str | None = None) -> list[BaseTool]:
     configured = specification or os.environ.get("AGENT_TOOL_PROVIDERS", DEFAULT_PROVIDERS)
     loaded: list[BaseTool] = []
@@ -96,7 +100,11 @@ def budgeted_tool(request, handler):
     try:
         result = handler(request)
         metadata = context.tool_metadata.pop(external_id, {})
-        status = metadata.pop("status", "succeeded")
+        status = metadata.pop("status", None)
+        if status is None:
+            status = "failed" if isinstance(result, ToolMessage) and result.status == "error" else "succeeded"
+            if status == "failed":
+                metadata.setdefault("error_code", "TOOL_CALL_REJECTED")
         metadata.setdefault("result_summary", {"result_type": type(result).__name__})
         if not settle_tool(context.run_id, context.lease_token, call_id, status, **metadata):
             raise PermissionError("execution lease was revoked")
@@ -110,12 +118,13 @@ def budgeted_tool(request, handler):
             content=json.dumps({"status": "error", "code": exc.code, "message": exc.message}),
             tool_call_id=external_id,
             name=request.tool_call["name"],
+            status="error",
         )
     except PermissionError:
         raise
     except Exception as exc:
         settle_tool(context.run_id, context.lease_token, call_id, "failed", error_code="TOOL_CALL_FAILED", result_summary={"exception_type": type(exc).__name__})
-        raise
+        raise ToolCallFailed from exc
     finally:
         context.tool_call_ids.pop(external_id, None)
         context.tool_metadata.pop(external_id, None)

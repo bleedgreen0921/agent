@@ -15,7 +15,8 @@ def upgrade(chain: str) -> None:
         raise ValueError(chain)
     cfg = Config()
     cfg.set_main_option("script_location", str(ROOT / ("rag_service" if chain == "rag" else "agent_service" if chain == "agent" else "identity") / "migrations"))
-    cfg.set_main_option("sqlalchemy.url", os.environ["MIGRATION_DATABASE_URL"].replace("postgresql://", "postgresql+psycopg://", 1))
+    database_url = os.environ["MIGRATION_DATABASE_URL"].replace("postgresql://", "postgresql+psycopg://", 1)
+    cfg.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
     cfg.set_main_option("version_table_schema", chain)
     command.upgrade(cfg, "head")
 

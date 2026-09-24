@@ -1,6 +1,7 @@
 import os
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -94,12 +95,28 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
                 state = client.get(f"/v1/admin/documents/{doc_id}/versions/{transient.json()['document_version_id']}", headers=admin).json()
                 assert state["attempts"] == attempt
                 assert state["status"] == ("failed" if attempt == 3 else "pending")
+        database_transient = client.post(f"/v1/admin/documents/{doc_id}/versions", headers=admin, files={"file": ("a.txt", b"database retry", "text/plain")})
+        with monkeypatch.context() as patch:
+            patch.setattr(worker, "process", lambda *args: (_ for _ in ()).throw(psycopg.OperationalError("temporary")))
+            for attempt in range(1, 4):
+                with connect("RAG_DATABASE_URL") as conn:
+                    conn.execute("UPDATE rag.processing_jobs SET available_at=now() WHERE version_id=%s", (UUID(database_transient.json()["document_version_id"]),))
+                assert worker.run_once()
+                state = client.get(f"/v1/admin/documents/{doc_id}/versions/{database_transient.json()['document_version_id']}", headers=admin).json()
+                assert state["attempts"] == attempt
+                assert state["error_code"] == "DATABASE_UNAVAILABLE"
+                assert state["status"] == ("failed" if attempt == 3 else "pending")
         assert client.post("/v1/evidence/search", headers=_service(teams[0]), json={"query": "beta"}).json()["evidences"][0]["document_version_id"] == "ver_" + second.json()["document_version_id"]
         duplicate_headers = {**admin, "Idempotency-Key": "duplicate-" + uuid4().hex}
         duplicate = client.post(f"/v1/admin/documents/{doc_id}/versions", headers=duplicate_headers, files={"file": ("renamed.txt", b"beta evidence", "text/plain")})
         assert duplicate.json()["document_version_id"] == second.json()["document_version_id"]
         duplicate_conflict = client.post(f"/v1/admin/documents/{doc_id}/versions", headers=duplicate_headers, files={"file": ("a.txt", b"different", "text/plain")})
         assert duplicate_conflict.status_code == 409
+        format_variant = client.post(f"/v1/admin/documents/{doc_id}/versions", headers=admin, files={"file": ("renamed.md", b"beta evidence", "text/markdown")})
+        assert format_variant.status_code == 202
+        assert format_variant.json()["document_version_id"] != second.json()["document_version_id"]
+        assert worker.run_once()
+        assert client.get(f"/v1/admin/documents/{doc_id}/versions/{format_variant.json()['document_version_id']}", headers=admin).json()["status"] == "active"
         assert client.get("/v1/evidence/" + evidence["evidence_id"], headers=_service(teams[0])).status_code == 200
         assert client.put(f"/v1/admin/documents/{doc_id}/access", headers=admin, json={"visibility": "restricted", "team_ids": [str(teams[1])]}).status_code == 200
         assert client.get("/v1/evidence/" + evidence["evidence_id"], headers=_service(teams[0])).status_code == 404

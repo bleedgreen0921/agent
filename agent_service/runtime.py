@@ -16,6 +16,13 @@ def claim_run() -> dict | None:
         conn.execute("""UPDATE agent.agent_runs SET status='failed',error_code='QUEUE_TIMEOUT',
             termination_reason='queue_timeout',finished_at=now()
             WHERE status='queued' AND queue_deadline_at<=now()""")
+        cancelled = conn.execute("""UPDATE agent.agent_runs SET status='cancelled',error_code=NULL,
+            termination_reason='cancelled',finished_at=now(),lease_token=NULL,leased_until=NULL
+            WHERE status='cancelling' AND (leased_until IS NULL OR leased_until<=now() OR execution_deadline_at<=now())
+            RETURNING id""").fetchall()
+        for item in cancelled:
+            conn.execute("UPDATE agent.model_calls SET status='interrupted_unknown',finished_at=now(),error_code='INTERRUPTED_UNKNOWN' WHERE run_id=%s AND status='started'", (item["id"],))
+            conn.execute("UPDATE agent.tool_calls SET status='interrupted_unknown',finished_at=now(),error_code='INTERRUPTED_UNKNOWN' WHERE run_id=%s AND status='started'", (item["id"],))
         expired = conn.execute("""UPDATE agent.agent_runs SET status='failed',error_code='RUN_TIMEOUT',
             termination_reason='run_timeout',finished_at=now(),lease_token=NULL,leased_until=NULL
             WHERE status='running' AND execution_deadline_at<=now() RETURNING id""").fetchall()
@@ -46,21 +53,20 @@ def claim_run() -> dict | None:
 
 
 def safe_to_resume(conn, run_id: UUID) -> bool:
-    started = conn.execute("""SELECT 1 FROM agent.model_calls WHERE run_id=%s AND status='started'
-        UNION ALL SELECT 1 FROM agent.tool_calls WHERE run_id=%s AND status='started' LIMIT 1""", (run_id, run_id)).fetchone()
-    if started:
-        return False
-    completed = conn.execute("""SELECT
-        (SELECT count(*) FROM agent.model_calls WHERE run_id=%s) +
-        (SELECT count(*) FROM agent.tool_calls WHERE run_id=%s) AS n""", (run_id, run_id)).fetchone()["n"]
-    if not completed:
-        return True
-    # Completed calls require a durable graph checkpoint before execution may resume.
-    table = conn.execute("SELECT to_regclass('agent.checkpoints') AS name").fetchone()["name"]
-    if not table:
-        return False
-    checkpoint = conn.execute("SELECT 1 FROM agent.checkpoints WHERE thread_id=%s LIMIT 1", (str(run_id),)).fetchone()
-    return bool(checkpoint)
+    unsafe = conn.execute("""SELECT 1 FROM agent.model_calls WHERE run_id=%s AND (status='started' OR NOT checkpointed)
+        UNION ALL SELECT 1 FROM agent.tool_calls WHERE run_id=%s AND (status='started' OR NOT checkpointed) LIMIT 1""", (run_id, run_id)).fetchone()
+    return not bool(unsafe)
+
+
+def mark_checkpointed_calls(run_id: UUID, token: UUID) -> bool:
+    with connect("AGENT_DATABASE_URL") as conn:
+        run = conn.execute("""SELECT id FROM agent.agent_runs WHERE id=%s AND lease_token=%s
+            AND status='running' AND leased_until>now() AND execution_deadline_at>now() FOR UPDATE""", (run_id, token)).fetchone()
+        if not run:
+            return False
+        conn.execute("UPDATE agent.model_calls SET checkpointed=true WHERE run_id=%s AND status<>'started' AND NOT checkpointed", (run_id,))
+        conn.execute("UPDATE agent.tool_calls SET checkpointed=true WHERE run_id=%s AND status<>'started' AND NOT checkpointed", (run_id,))
+    return True
 
 
 def mark_interrupted(conn, run_id: UUID) -> None:

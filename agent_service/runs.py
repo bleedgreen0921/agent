@@ -86,6 +86,7 @@ def public_error_message(code: str) -> str:
         "QUEUE_TIMEOUT": "Run expired before execution started",
         "RUN_TIMEOUT": "Run exceeded its execution deadline",
         "MODEL_CALL_FAILED": "The model service failed",
+        "TOOL_CALL_FAILED": "A tool provider failed",
         "INVALID_PLAN": "The generated plan was invalid",
         "AUTH_FAILED": "A service authentication check failed",
         "ACCESS_DENIED": "Access was denied",

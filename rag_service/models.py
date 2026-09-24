@@ -31,7 +31,7 @@ def embed(texts: list[str], model: str, dimensions: int) -> list[list[float]]:
         return vectors
     except ModelFailure:
         raise
-    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+    except httpx.TransportError as exc:
         raise ModelFailure("EMBEDDING_UNAVAILABLE") from exc
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise ModelFailure("EMBEDDING_RESPONSE_INVALID", False) from exc
@@ -54,7 +54,7 @@ def rerank(query: str, contents: list[str]) -> list[int]:
         return [item["index"] for item in sorted(results, key=lambda item: -item["relevance_score"])]
     except ModelFailure:
         raise
-    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+    except httpx.TransportError as exc:
         raise ModelFailure("RERANK_UNAVAILABLE") from exc
     except (ValueError, KeyError, TypeError) as exc:
         raise ModelFailure("RERANK_RESPONSE_INVALID") from exc

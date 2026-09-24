@@ -116,7 +116,7 @@ curl http://127.0.0.1:8002/v1/runs/RUN_UUID -H "Authorization: Bearer $TEAM_KEY"
 curl -X POST http://127.0.0.1:8002/v1/runs/RUN_UUID/cancel -H "Authorization: Bearer $TEAM_KEY"
 ```
 
-父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。失租时若存在结果未知的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
+父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。只有已经显式确认写入 LangGraph checkpoint 的调用才允许恢复；失租时若存在结果未知或尚未确认持久化的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
 
 ```sh
 .venv/bin/python -m agent_service.worker

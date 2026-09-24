@@ -35,6 +35,6 @@ export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,my_package.agent_tool
 
 注册表要求工具名全局唯一。所有加载的工具都会自动经过同一中间件，在调用前预留 Run 工具预算、写入持久调用记录，并关联触发它的模型调用。参数 trace 只保存参数名和整体 SHA-256；通用结果 trace 只保存结果类型。提供者可以通过 `runtime.context.add_tool_metadata(...)` 增加不含敏感正文的状态、服务请求 ID 或结果摘要。
 
-可处理的业务错误可以抛出 `RecoverableToolError`，中间件会记录失败并把结构化错误观察交回 Agent。身份、授权和配额等必须终止 Run 的错误抛出 `FatalToolError`。其他未分类异常会记录为 `TOOL_CALL_FAILED` 并停止本次执行，不会自动重试。
+可处理的业务错误可以抛出 `RecoverableToolError`，中间件会把数据库 trace 和返回给 Agent 的 `ToolMessage` 都标记为错误。身份、授权和配额等必须终止 Run 的错误抛出 `FatalToolError`。其他未分类异常会把工具 trace 和 Run 都记录为 `TOOL_CALL_FAILED` 并停止本次执行，不会自动重试。未知工具或参数校验失败同样记录为失败的工具调用，但作为错误观察交回 Agent，不立即终止 Run。
 
 普通工具的输出会进入 ReAct 或 Plan 步骤上下文和最终生成摘要。能够产生可引用证据的工具还需把符合公共 `Evidence` 契约的数据放入 `runtime.context.evidence`；最终发布仍只接受本 Run 实际收到的 evidence ID。这样可以扩展计算、搜索或数据查询工具，同时维持统一的预算、身份、trace 和引用规则。
