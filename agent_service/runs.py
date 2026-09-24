@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 
+from agent_service.versions import GRAPH_VERSION
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode, RunCreate
 from db.connection import connect
@@ -44,8 +45,8 @@ def create_run(body: RunCreate, principal: Principal, key: str | None) -> tuple[
                 if bytes(existing["request_digest"]) != digest:
                     raise ApiError(409, ErrorCode.IDEMPOTENCY_CONFLICT, "Idempotency key conflict")
                 return {"run_id": str(existing["id"]), "status": existing["status"], "created_at": existing["created_at"]}, True
-        conn.execute("""INSERT INTO agent.agent_runs(id,team_id,key_id,task,mode,status,request_digest,idempotency_key,queue_deadline_at)
-            VALUES (%s,%s,%s,%s,%s,'queued',%s,%s,%s)""", (run_id, principal.team_id, principal.key_id, body.task, body.mode, digest, key, now + timedelta(seconds=queue_seconds)))
+        conn.execute("""INSERT INTO agent.agent_runs(id,team_id,key_id,task,mode,status,request_digest,idempotency_key,queue_deadline_at,graph_version)
+            VALUES (%s,%s,%s,%s,%s,'queued',%s,%s,%s,%s)""", (run_id, principal.team_id, principal.key_id, body.task, body.mode, digest, key, now + timedelta(seconds=queue_seconds), GRAPH_VERSION))
     return {"run_id": str(run_id), "status": "queued", "created_at": now}, False
 
 
@@ -122,3 +123,189 @@ def trace(run_id: UUID) -> dict:
         models = conn.execute("SELECT * FROM agent.model_calls WHERE run_id=%s ORDER BY started_at,id", (run_id,)).fetchall()
         tools = conn.execute("SELECT * FROM agent.tool_calls WHERE run_id=%s ORDER BY started_at,id", (run_id,)).fetchall()
     return {"run": dict(run), "steps": [dict(row) for row in steps], "model_calls": [dict(row) for row in models], "tool_calls": [dict(row) for row in tools]}
+
+
+def timeline(run_id: UUID) -> dict:
+    with connect("AGENT_DATABASE_URL") as conn:
+        run = conn.execute("""SELECT id,mode,status,created_at,started_at,finished_at,error_code,termination_reason
+            FROM agent.agent_runs WHERE id=%s""", (run_id,)).fetchone()
+        if not run:
+            raise ApiError(404, ErrorCode.NOT_FOUND, "Run not found")
+        manifest = conn.execute("SELECT schema_version,manifest,captured_at FROM agent.run_manifests WHERE run_id=%s", (run_id,)).fetchone()
+        steps = conn.execute("""SELECT id,ordinal,goal,completion_condition,status,result_summary,
+            started_at,finished_at,error_code FROM agent.run_steps
+            WHERE run_id=%s AND started_at IS NOT NULL""", (run_id,)).fetchall()
+        models = conn.execute("""SELECT id,step_id,purpose,model,status,started_at,finished_at,
+            input_summary,output_summary,input_tokens,output_tokens,error_code,checkpointed
+            FROM agent.model_calls WHERE run_id=%s""", (run_id,)).fetchall()
+        tools = conn.execute("""SELECT id,step_id,triggering_model_call_id,tool_name,status,started_at,finished_at,
+            argument_summary,result_summary,service_request_id,retrieval_id,evidence_ids,error_code,checkpointed
+            FROM agent.tool_calls WHERE run_id=%s""", (run_id,)).fetchall()
+        result = conn.execute("""SELECT r.id,r.created_at,
+            (SELECT count(*) FROM agent.result_claims c WHERE c.result_id=r.id) AS claim_count,
+            (SELECT count(*) FROM agent.evidence_snapshots e WHERE e.result_id=r.id) AS citation_count,
+            jsonb_array_length(r.notices) AS notice_count
+            FROM agent.run_results r WHERE r.run_id=%s""", (run_id,)).fetchone()
+
+    run_entity = str(run["id"])
+    events: list[dict] = [
+        {
+            "event_id": f"run:{run_entity}:created",
+            "type": "run_created",
+            "occurred_at": run["created_at"],
+            "finished_at": None,
+            "status": "queued",
+            "entity_id": run_entity,
+            "step_id": None,
+            "parent_id": None,
+            "name": None,
+            "details": {"mode": run["mode"]},
+        }
+    ]
+    if manifest:
+        events.append({
+            "event_id": f"run:{run_entity}:manifest",
+            "type": "manifest_captured",
+            "occurred_at": manifest["captured_at"],
+            "finished_at": None,
+            "status": "captured",
+            "entity_id": run_entity,
+            "step_id": None,
+            "parent_id": None,
+            "name": None,
+            "details": {"schema_version": manifest["schema_version"]},
+        })
+    if run["started_at"]:
+        events.append({
+            "event_id": f"run:{run_entity}:started",
+            "type": "run_started",
+            "occurred_at": run["started_at"],
+            "finished_at": None,
+            "status": "running",
+            "entity_id": run_entity,
+            "step_id": None,
+            "parent_id": None,
+            "name": None,
+            "details": {},
+        })
+    for row in steps:
+        entity_id = str(row["id"])
+        events.append({
+            "event_id": f"step:{entity_id}",
+            "type": "step",
+            "occurred_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "status": row["status"],
+            "entity_id": entity_id,
+            "step_id": entity_id,
+            "parent_id": None,
+            "name": None,
+            "details": {
+                "ordinal": row["ordinal"],
+                "goal": row["goal"],
+                "completion_condition": row["completion_condition"],
+                "result_summary": row["result_summary"],
+                "error_code": row["error_code"],
+            },
+        })
+    for row in models:
+        entity_id = str(row["id"])
+        events.append({
+            "event_id": f"model:{entity_id}",
+            "type": "model_call",
+            "occurred_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "status": row["status"],
+            "entity_id": entity_id,
+            "step_id": str(row["step_id"]) if row["step_id"] else None,
+            "parent_id": None,
+            "name": row["model"],
+            "details": {
+                "purpose": row["purpose"],
+                "model": row["model"],
+                "input_tokens": row["input_tokens"],
+                "output_tokens": row["output_tokens"],
+                "input_summary": row["input_summary"],
+                "output_summary": row["output_summary"],
+                "error_code": row["error_code"],
+                "checkpointed": row["checkpointed"],
+            },
+        })
+    for row in tools:
+        entity_id = str(row["id"])
+        events.append({
+            "event_id": f"tool:{entity_id}",
+            "type": "tool_call",
+            "occurred_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "status": row["status"],
+            "entity_id": entity_id,
+            "step_id": str(row["step_id"]) if row["step_id"] else None,
+            "parent_id": str(row["triggering_model_call_id"]) if row["triggering_model_call_id"] else None,
+            "name": row["tool_name"],
+            "details": {
+                "tool_name": row["tool_name"],
+                "argument_summary": row["argument_summary"],
+                "result_summary": row["result_summary"],
+                "service_request_id": row["service_request_id"],
+                "retrieval_id": row["retrieval_id"],
+                "evidence_ids": row["evidence_ids"],
+                "error_code": row["error_code"],
+                "checkpointed": row["checkpointed"],
+            },
+        })
+    if result:
+        entity_id = str(result["id"])
+        events.append({
+            "event_id": f"result:{entity_id}",
+            "type": "result_published",
+            "occurred_at": result["created_at"],
+            "finished_at": None,
+            "status": "published",
+            "entity_id": entity_id,
+            "step_id": None,
+            "parent_id": None,
+            "name": None,
+            "details": {
+                "claim_count": result["claim_count"],
+                "citation_count": result["citation_count"],
+                "notice_count": result["notice_count"],
+            },
+        })
+    if run["finished_at"]:
+        events.append({
+            "event_id": f"run:{run_entity}:finished",
+            "type": "run_finished",
+            "occurred_at": run["finished_at"],
+            "finished_at": run["finished_at"],
+            "status": run["status"],
+            "entity_id": run_entity,
+            "step_id": None,
+            "parent_id": None,
+            "name": None,
+            "details": {"termination_reason": run["termination_reason"], "error_code": run["error_code"]},
+        })
+
+    priority = {
+        "run_created": 0,
+        "manifest_captured": 1,
+        "run_started": 2,
+        "step": 3,
+        "model_call": 4,
+        "tool_call": 5,
+        "result_published": 6,
+        "run_finished": 7,
+    }
+    events.sort(key=lambda item: (item["occurred_at"], priority[item["type"]], item["entity_id"] or ""))
+    for sequence, event in enumerate(events, 1):
+        event["sequence"] = sequence
+    return {
+        "run_id": run_entity,
+        "status": run["status"],
+        "manifest": {
+            "schema_version": manifest["schema_version"],
+            "captured_at": manifest["captured_at"],
+            "data": manifest["manifest"],
+        } if manifest else None,
+        "events": events,
+    }

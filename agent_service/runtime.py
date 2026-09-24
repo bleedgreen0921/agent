@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
+from agent_service.manifest import execution_manifest, schema_version
 from db.connection import connect
 
 
@@ -44,6 +45,11 @@ def claim_run() -> dict | None:
             return None
         token = uuid4()
         first = row["started_at"] is None
+        conn.execute(
+            """INSERT INTO agent.run_manifests(run_id,schema_version,manifest)
+            VALUES (%s,%s,%s) ON CONFLICT (run_id) DO NOTHING""",
+            (row["id"], schema_version(), Jsonb(execution_manifest())),
+        )
         conn.execute("""UPDATE agent.agent_runs SET status='running',lease_token=%s,
             leased_until=now()+(%s * interval '1 second'),heartbeat_at=now(),
             started_at=COALESCE(started_at,now()),

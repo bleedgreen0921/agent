@@ -12,9 +12,10 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 
 from agent_service.runtime import reserve_tool, settle_tool
+from agent_service.versions import DEFAULT_TOOL_PROVIDERS
 
 
-DEFAULT_PROVIDERS = "agent_service.tools.rag:tools"
+DEFAULT_PROVIDERS = DEFAULT_TOOL_PROVIDERS
 
 
 @dataclass

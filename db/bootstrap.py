@@ -43,6 +43,10 @@ def main() -> None:
         for role in ("rag_runtime", "agent_runtime"):
             conn.execute(sql.SQL("GRANT USAGE ON SCHEMA identity TO {}").format(sql.Identifier(role)))
             conn.execute(sql.SQL("GRANT SELECT ON identity.teams, identity.credentials TO {}").format(sql.Identifier(role)))
+        # Execution manifests are immutable to the runtime role even though the
+        # rest of the Agent schema follows the normal CRUD default privileges.
+        conn.execute("REVOKE UPDATE, DELETE ON agent.run_manifests FROM agent_runtime")
+        conn.execute("GRANT SELECT, INSERT ON agent.run_manifests TO agent_runtime")
         conn.execute("REVOKE ALL ON identity.alembic_version, rag.alembic_version, agent.alembic_version FROM rag_runtime, agent_runtime, identity_admin")
 
 
