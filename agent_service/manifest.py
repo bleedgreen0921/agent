@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from agent_service.versions import DEFAULT_TOOL_PROVIDERS, GRAPH_VERSION, MANIFEST_SCHEMA_VERSION, PROMPT_SET_VERSION
+from agent_service.timeouts import configured_timeouts
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +45,7 @@ def application_revision() -> dict:
 
 
 def execution_manifest() -> dict:
+    timeouts = configured_timeouts()
     model_url = os.environ.get("AGENT_MODEL_URL", "")
     providers = [item.strip() for item in os.environ.get("AGENT_TOOL_PROVIDERS", DEFAULT_TOOL_PROVIDERS).split(",") if item.strip()]
     return {
@@ -64,6 +66,8 @@ def execution_manifest() -> dict:
             "model_calls": 16,
             "tool_calls": 10,
             "execution_timeout_seconds": int(os.environ.get("AGENT_EXECUTION_TIMEOUT_SECONDS", "300")),
+            "model_timeout_seconds": timeouts.model_seconds,
+            "rag_timeout_seconds": timeouts.rag_seconds,
         },
     }
 

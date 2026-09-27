@@ -1,6 +1,7 @@
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,9 +19,11 @@ class ErrorCode(StrEnum):
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
     VERSION_IN_PROGRESS = "VERSION_IN_PROGRESS"
     RAG_UNAVAILABLE = "RAG_UNAVAILABLE"
+    RAG_TIMEOUT = "RAG_TIMEOUT"
     QUEUE_TIMEOUT = "QUEUE_TIMEOUT"
     RUN_TIMEOUT = "RUN_TIMEOUT"
     MODEL_CALL_FAILED = "MODEL_CALL_FAILED"
+    MODEL_TIMEOUT = "MODEL_TIMEOUT"
     TOOL_CALL_FAILED = "TOOL_CALL_FAILED"
     INVALID_PLAN = "INVALID_PLAN"
     AUTH_FAILED = "AUTH_FAILED"
@@ -51,6 +54,39 @@ class RunAccepted(StrictModel):
     run_id: str
     status: RunStatus
     created_at: datetime
+
+
+class RunListItem(StrictModel):
+    id: UUID
+    mode: Literal["react", "plan_execute"]
+    status: RunStatus
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_code: str | None
+
+
+class AdminRunListItem(RunListItem):
+    team_id: UUID
+
+
+class RunList(StrictModel):
+    items: list[RunListItem]
+    next_cursor: str | None
+
+
+class AdminRunList(StrictModel):
+    items: list[AdminRunListItem]
+    next_cursor: str | None
+
+
+class RunQueueSummary(StrictModel):
+    queued_within_deadline: int
+    queued_past_deadline: int
+    running_lease_valid: int
+    running_lease_expired: int
+    cancelling: int
+    oldest_claimable_created_at: datetime | None
 
 
 class SourceLocator(StrictModel):

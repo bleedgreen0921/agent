@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from contracts.errors import install_errors
+from db.readiness import rag_ready
 from identity.api import router as identity_router
 from rag_service.api import admin_router, evidence_router
 
@@ -14,3 +15,10 @@ app.include_router(evidence_router)
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "rag"}
+
+
+@app.get("/health/ready")
+def readiness(response: Response):
+    ready = rag_ready()
+    response.status_code = 200 if ready else 503
+    return {"service": "rag", "status": "ok" if ready else "unavailable"}

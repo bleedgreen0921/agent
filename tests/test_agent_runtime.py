@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
+import httpx
+import openai
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
@@ -121,6 +123,24 @@ class InvalidPlanModel(ScriptedModel):
         return super().with_structured_output(schema, **kwargs)
 
 
+class PhaseTimeoutModel(ScriptedModel):
+    phase: str
+
+    @staticmethod
+    def timeout():
+        raise openai.APITimeoutError(request=httpx.Request("POST", "http://model.test/v1/chat/completions"))
+
+    def _generate(self, *args, **kwargs):
+        if self.phase == "react":
+            self.timeout()
+        return super()._generate(*args, **kwargs)
+
+    def with_structured_output(self, schema, **kwargs):
+        if (schema is execution.Plan and self.phase == "planner") or (schema is execution.FinalDraft and self.phase == "final"):
+            return RunnableLambda(lambda _messages: self.timeout())
+        return super().with_structured_output(schema, **kwargs)
+
+
 seen_tool_context: list[tuple[UUID | None, UUID]] = []
 
 
@@ -190,6 +210,14 @@ class UnauthorizedRagClient(FakeRagClient):
 class UnavailableRagClient(FakeRagClient):
     def search(self, _run_id, _tool_call_id, _request):
         raise RagError(503, ErrorCode.RAG_UNAVAILABLE)
+
+
+class TimedOutRagClient(FakeRagClient):
+    def search(self, _run_id, _tool_call_id, _request):
+        raise RagError(503, ErrorCode.RAG_TIMEOUT)
+
+    def read(self, _run_id, _tool_call_id, _evidence_id):
+        raise RagError(503, ErrorCode.RAG_TIMEOUT)
 
 
 class PartialPlanModel(ScriptedModel):
@@ -482,6 +510,133 @@ def test_rag_unavailable_degrades_without_failing_run(monkeypatch):
     with connect("AGENT_DATABASE_URL") as conn:
         call = conn.execute("SELECT status,error_code FROM agent.tool_calls WHERE run_id=%s", (run_id,)).fetchone()
     assert call == {"status": "degraded", "error_code": "RAG_UNAVAILABLE"}
+
+
+@pytest.mark.parametrize(("mode", "phase", "expected_calls"), [
+    ("react", "react", 1),
+    ("plan_execute", "planner", 1),
+    ("react", "final", 2),
+    ("plan_execute", "final", 3),
+])
+def test_model_timeout_fails_run_and_settles_single_call(monkeypatch, mode, phase, expected_calls):
+    quiesce_runs()
+    monkeypatch.setenv("AGENT_MODEL", "scripted")
+    monkeypatch.setattr(execution, "model", lambda: PhaseTimeoutModel(phase=phase, responses=[AIMessage(content="Execution summary")]))
+    team_id, _ = credential()
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    with connect("AGENT_DATABASE_URL") as conn:
+        conn.execute("UPDATE agent.agent_runs SET mode=%s WHERE id=%s", (mode, run_id))
+    claimed = claim_run()
+    execution.execute_run(run_id, claimed["lease_token"])
+    result = RunResponse.model_validate(get_run(run_id, team_id))
+    assert result.status == "failed"
+    assert result.error.code == ErrorCode.MODEL_TIMEOUT
+    with connect("AGENT_DATABASE_URL") as conn:
+        run = conn.execute("SELECT model_calls_used FROM agent.agent_runs WHERE id=%s", (run_id,)).fetchone()
+        calls = conn.execute("SELECT purpose,status,error_code FROM agent.model_calls WHERE run_id=%s ORDER BY started_at,id", (run_id,)).fetchall()
+    assert run["model_calls_used"] == expected_calls
+    assert len(calls) == expected_calls
+    assert len([call for call in calls if call["error_code"] == "MODEL_TIMEOUT"]) == 1
+    assert all(call["status"] != "started" for call in calls)
+
+
+@pytest.mark.parametrize("reason", ["cancel", "timeout"])
+def test_revoked_lease_cannot_reclassify_timeout(monkeypatch, reason):
+    quiesce_runs()
+    team_id, _ = credential()
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    claimed = claim_run()
+    token = claimed["lease_token"]
+    call_id = reserve_model(run_id, token, "react", "mock-model")
+    if reason == "cancel":
+        cancel_run(run_id, team_id)
+    else:
+        with connect("AGENT_DATABASE_URL") as conn:
+            conn.execute("UPDATE agent.agent_runs SET execution_deadline_at=now()-interval '1 second' WHERE id=%s", (run_id,))
+    assert not settle_model(run_id, token, call_id, "failed", error_code="MODEL_TIMEOUT")
+    from agent_service.runtime import fail_run
+    assert not fail_run(run_id, token, "MODEL_TIMEOUT")
+    revoke_and_finish(run_id, token, reason)
+    assert not settle_model(run_id, token, call_id, "failed", error_code="MODEL_TIMEOUT")
+    assert not fail_run(run_id, token, "MODEL_TIMEOUT")
+    with connect("AGENT_DATABASE_URL") as conn:
+        row = conn.execute("SELECT status,error_code FROM agent.agent_runs WHERE id=%s", (run_id,)).fetchone()
+    assert row == ({"status": "cancelled", "error_code": None} if reason == "cancel" else {"status": "failed", "error_code": "RUN_TIMEOUT"})
+
+
+@pytest.mark.parametrize(("mode", "expected_models"), [("react", 2), ("plan_execute", 3)])
+def test_resumed_run_uses_manifest_timeout_snapshot(monkeypatch, mode, expected_models):
+    quiesce_runs()
+    monkeypatch.setenv("AGENT_MODEL", "scripted")
+    monkeypatch.setenv("RAG_BASE_URL", "http://rag.test")
+    monkeypatch.setenv("RAG_SERVICE_TOKEN", "service-token")
+    monkeypatch.setenv("AGENT_MODEL_TIMEOUT_SECONDS", "7")
+    monkeypatch.setenv("AGENT_RAG_TIMEOUT_SECONDS", "11")
+    team_id, _ = credential()
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    with connect("AGENT_DATABASE_URL") as conn:
+        conn.execute("UPDATE agent.agent_runs SET mode=%s WHERE id=%s", (mode, run_id))
+    first = claim_run()
+    with connect("AGENT_DATABASE_URL") as conn:
+        manifest = conn.execute("SELECT manifest FROM agent.run_manifests WHERE run_id=%s", (run_id,)).fetchone()["manifest"]
+        conn.execute("UPDATE agent.agent_runs SET leased_until=now()-interval '1 second' WHERE id=%s", (run_id,))
+    assert manifest["limits"]["model_timeout_seconds"] == 7
+    assert manifest["limits"]["rag_timeout_seconds"] == 11
+    monkeypatch.setenv("AGENT_MODEL_TIMEOUT_SECONDS", "17")
+    monkeypatch.setenv("AGENT_RAG_TIMEOUT_SECONDS", "19")
+    resumed = claim_run()
+    assert resumed and resumed["run_id"] == run_id and not resumed["first_claim"]
+    assert resumed["lease_token"] != first["lease_token"]
+    seen = []
+    rag_timeouts = []
+
+    class CapturingRagClient(FakeRagClient):
+        def __init__(self, *args, **kwargs):
+            rag_timeouts.append(kwargs["timeout_seconds"])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(rag_tools, "RagClient", CapturingRagClient)
+
+    def scripted_model():
+        seen.append(execution.current_timeouts())
+        return ScriptedModel(responses=[
+            AIMessage(content="", tool_calls=[{"name": "search_evidence", "args": {"query": "snapshot"}, "id": "snapshot-tool", "type": "tool_call"}]),
+            AIMessage(content="Execution summary"),
+        ])
+
+    monkeypatch.setattr(execution, "model", scripted_model)
+    execution.execute_run(run_id, resumed["lease_token"])
+    assert get_run(run_id, team_id)["status"] == "completed"
+    assert len(seen) == expected_models
+    assert all(item.model_seconds == 7 and item.rag_seconds == 11 for item in seen)
+    assert rag_timeouts == [11]
+
+
+@pytest.mark.parametrize(("tool_name", "expected_status", "expected_notice"), [
+    ("search_evidence", "degraded", "RAG_UNAVAILABLE"),
+    ("read_evidence", "failed", None),
+])
+def test_rag_timeout_search_and_read_observations(monkeypatch, tool_name, expected_status, expected_notice):
+    quiesce_runs()
+    monkeypatch.setenv("AGENT_MODEL", "scripted")
+    monkeypatch.setenv("RAG_BASE_URL", "http://rag.test")
+    monkeypatch.setenv("RAG_SERVICE_TOKEN", "service-token")
+    args = {"query": "retention"} if tool_name == "search_evidence" else {"evidence_id": "ev-missing"}
+    messages = [AIMessage(content="", tool_calls=[{"name": tool_name, "args": args, "id": "tool-timeout", "type": "tool_call"}]), AIMessage(content="The tool timed out.")]
+    monkeypatch.setattr(execution, "model", lambda: ScriptedModel(responses=messages))
+    monkeypatch.setattr(rag_tools, "RagClient", TimedOutRagClient)
+    team_id, _ = credential()
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    claimed = claim_run()
+    execution.execute_run(run_id, claimed["lease_token"])
+    result = get_run(run_id, team_id)
+    assert result["status"] == "completed"
+    assert (expected_notice in [item["code"] for item in result["result"]["notices"]]) if expected_notice else not any(item["code"] == "RAG_UNAVAILABLE" for item in result["result"]["notices"])
+    with connect("AGENT_DATABASE_URL") as conn:
+        run = conn.execute("SELECT tool_calls_used FROM agent.agent_runs WHERE id=%s", (run_id,)).fetchone()
+        call = conn.execute("SELECT status,error_code FROM agent.tool_calls WHERE run_id=%s", (run_id,)).fetchone()
+    assert run["tool_calls_used"] == 1
+    assert call == {"status": expected_status, "error_code": "RAG_TIMEOUT"}
 
 
 def test_invalid_plan_has_stable_failure_code(monkeypatch):

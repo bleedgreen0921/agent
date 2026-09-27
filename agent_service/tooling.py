@@ -31,6 +31,7 @@ class ToolExecutionContext:
     tool_call_ids: dict[str, UUID] = field(default_factory=dict)
     tool_metadata: dict[str, dict] = field(default_factory=dict)
     triggering_model_call_id: UUID | None = None
+    rag_timeout_seconds: float | None = None
 
     def business_call_id(self, tool_call_id: str | None) -> UUID:
         if not tool_call_id or tool_call_id not in self.tool_call_ids:

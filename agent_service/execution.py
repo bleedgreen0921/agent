@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+from contextvars import ContextVar
 from typing import Annotated, Literal, TypedDict
 from uuid import UUID, uuid4
 
@@ -9,6 +10,8 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRequest, ModelResponse, wrap_model_call
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+import httpx
+import openai
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,10 +19,20 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent_service.checkpoints import with_agent_search_path
 from agent_service.runtime import BudgetExhausted, fail_run, mark_checkpointed_calls, publish_result, reserve_model, settle_model
 from agent_service.tooling import FatalToolError, ToolCallFailed, ToolExecutionContext, budgeted_tool, load_tools
+from agent_service.timeouts import CallTimeouts, configured_timeouts, timeouts_for_manifest
 from db.connection import connect
 
 
 log = logging.getLogger(__name__)
+_run_timeouts: ContextVar[CallTimeouts | None] = ContextVar("agent_run_timeouts", default=None)
+
+
+def current_timeouts() -> CallTimeouts:
+    return _run_timeouts.get() or configured_timeouts()
+
+
+class ModelTimeoutError(RuntimeError):
+    pass
 
 
 class Strict(BaseModel):
@@ -67,7 +80,7 @@ def model() -> ChatOpenAI:
     if not base_url or not name:
         raise RuntimeError("AGENT_MODEL_URL and AGENT_MODEL are required")
     normalized = base_url.rstrip("/")
-    return ChatOpenAI(model=name, base_url=normalized if normalized.endswith("/v1") else normalized + "/v1", api_key=api_key, timeout=None, max_retries=0, temperature=0)
+    return ChatOpenAI(model=name, base_url=normalized if normalized.endswith("/v1") else normalized + "/v1", api_key=api_key, timeout=current_timeouts().model_seconds, max_retries=0, temperature=0)
 
 
 @wrap_model_call
@@ -88,6 +101,10 @@ def budgeted_model(request: ModelRequest, handler) -> ModelResponse:
             raise PermissionError("execution lease was revoked")
         context.triggering_model_call_id = call_id
         return response
+    except (openai.APITimeoutError, httpx.TimeoutException, TimeoutError) as exc:
+        if not settle_model(context.run_id, context.lease_token, call_id, "failed", error_code="MODEL_TIMEOUT", output_summary={"exception_type": type(exc).__name__}):
+            raise PermissionError("execution lease was revoked") from exc
+        raise ModelTimeoutError from exc
     except (BudgetExhausted, PermissionError):
         raise
     except Exception as exc:
@@ -113,6 +130,10 @@ def invoke_structured(llm, schema, messages, context: ExecutionContext, purpose:
         if not settle_model(context.run_id, context.lease_token, call_id, "succeeded", output_summary={"schema": schema.__name__}):
             raise PermissionError("execution lease was revoked")
         return result
+    except (openai.APITimeoutError, httpx.TimeoutException, TimeoutError) as exc:
+        if not settle_model(context.run_id, context.lease_token, call_id, "failed", error_code="MODEL_TIMEOUT", output_summary={"exception_type": type(exc).__name__}):
+            raise PermissionError("execution lease was revoked") from exc
+        raise ModelTimeoutError from exc
     except (BudgetExhausted, PermissionError):
         raise
     except Exception as exc:
@@ -166,7 +187,7 @@ def run_plan(run_id: UUID, token: UUID, team_id: UUID, key_id: str, task: str, s
     agent = react_agent(saver)
 
     def plan_node(state: PlanState):
-        context = ExecutionContext(run_id, token, team_id=team_id, key_id=key_id, purpose="planner")
+        context = ExecutionContext(run_id, token, team_id=team_id, key_id=key_id, purpose="planner", rag_timeout_seconds=current_timeouts().rag_seconds)
         try:
             plan = invoke_structured(llm, Plan, [("system", "Create a fixed plan of 1 to 5 ordered steps. Each step needs a goal and observable completion condition. Do not prescribe tool names."), ("user", state["task"])], context, "planner")
         except ValueError as exc:
@@ -193,6 +214,7 @@ def run_plan(run_id: UUID, token: UUID, team_id: UUID, key_id: str, task: str, s
             purpose="react_step",
             evidence=dict(state.get("evidence", {})),
             notices=list(state.get("notices", [])),
+            rag_timeout_seconds=current_timeouts().rag_seconds,
         )
         prompt = json.dumps(
             {
@@ -239,14 +261,17 @@ def run_plan(run_id: UUID, token: UUID, team_id: UUID, key_id: str, task: str, s
 
 def execute_run(run_id: UUID, token: UUID) -> None:
     with connect("AGENT_DATABASE_URL") as conn:
-        run = conn.execute("SELECT task,mode,team_id,key_id FROM agent.agent_runs WHERE id=%s AND lease_token=%s AND status='running'", (run_id, token)).fetchone()
+        run = conn.execute("""SELECT r.task,r.mode,r.team_id,r.key_id,m.manifest FROM agent.agent_runs r
+            LEFT JOIN agent.run_manifests m ON m.run_id=r.id
+            WHERE r.id=%s AND r.lease_token=%s AND r.status='running'""", (run_id, token)).fetchone()
     if not run:
         return
+    timeout_token = _run_timeouts.set(timeouts_for_manifest(run["manifest"]))
     try:
         dsn = with_agent_search_path(os.environ["AGENT_DATABASE_URL"])
         with PostgresSaver.from_conn_string(dsn) as saver:
             if run["mode"] == "react":
-                context = ExecutionContext(run_id, token, team_id=run["team_id"], key_id=run["key_id"])
+                context = ExecutionContext(run_id, token, team_id=run["team_id"], key_id=run["key_id"], rag_timeout_seconds=current_timeouts().rag_seconds)
                 agent = react_agent(saver)
                 config = {"configurable": {"thread_id": str(run_id)}, "recursion_limit": 64}
                 snapshot = agent.get_state(config)
@@ -258,18 +283,22 @@ def execute_run(run_id: UUID, token: UUID) -> None:
                 partial = False
             else:
                 summaries, evidence, notices, partial = run_plan(run_id, token, run["team_id"], run["key_id"], run["task"], saver)
-                context = ExecutionContext(run_id, token, team_id=run["team_id"], key_id=run["key_id"], evidence=evidence, notices=notices)
+                context = ExecutionContext(run_id, token, team_id=run["team_id"], key_id=run["key_id"], evidence=evidence, notices=notices, rag_timeout_seconds=current_timeouts().rag_seconds)
             draft = final_generate(run["task"], summaries, context, partial)
             publish_result(run_id, token, draft, context.evidence, partial, "budget_exhausted" if partial else "model_finished")
     except BudgetExhausted:
         try:
-            context = locals().get("context") or ExecutionContext(run_id, token, team_id=run["team_id"], key_id=run["key_id"])
+            context = locals().get("context") or ExecutionContext(run_id, token, team_id=run["team_id"], key_id=run["key_id"], rag_timeout_seconds=current_timeouts().rag_seconds)
             draft = final_generate(run["task"], locals().get("summaries", []), context, True)
             publish_result(run_id, token, draft, context.evidence, True, "budget_exhausted")
+        except ModelTimeoutError:
+            fail_run(run_id, token, "MODEL_TIMEOUT")
         except Exception:
             fail_run(run_id, token, "QUOTA_EXCEEDED", "budget_exhausted_without_result")
     except InvalidPlanError as exc:
         fail_run(run_id, token, "INVALID_PLAN", type(exc).__name__)
+    except ModelTimeoutError:
+        fail_run(run_id, token, "MODEL_TIMEOUT")
     except ValueError as exc:
         fail_run(run_id, token, "MODEL_CALL_FAILED", type(exc).__name__)
     except FatalToolError as exc:
@@ -282,3 +311,5 @@ def execute_run(run_id: UUID, token: UUID) -> None:
     except Exception:
         log.exception("Agent run execution failed", extra={"run_id": str(run_id)})
         fail_run(run_id, token, "MODEL_CALL_FAILED")
+    finally:
+        _run_timeouts.reset(timeout_token)

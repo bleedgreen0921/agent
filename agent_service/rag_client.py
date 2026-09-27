@@ -7,6 +7,7 @@ import httpx
 
 from contracts.v1 import ErrorCode, ErrorResponse, Evidence, EvidenceSearchRequest, EvidenceSearchResponse
 from db.connection import connect
+from agent_service.timeouts import configured_timeouts, positive_seconds
 
 
 @dataclass(frozen=True)
@@ -31,10 +32,11 @@ class RagError(Exception):
 
 
 class RagClient:
-    def __init__(self, base_url: str, service_token: str, client: httpx.Client | None = None):
+    def __init__(self, base_url: str, service_token: str, client: httpx.Client | None = None, timeout_seconds: float | None = None):
         self.base_url = base_url.rstrip("/")
         self.service_token = service_token
-        self.client = client or httpx.Client(timeout=None)
+        seconds = configured_timeouts().rag_seconds if timeout_seconds is None else positive_seconds(timeout_seconds, "AGENT_RAG_TIMEOUT_SECONDS")
+        self.client = client if client is not None else httpx.Client(timeout=httpx.Timeout(connect=5.0, read=seconds, write=seconds, pool=seconds))
 
     def search(self, run_id: UUID, tool_call_id: str, request: EvidenceSearchRequest) -> EvidenceSearchResponse:
         context = TrustedRunContext.from_persisted_run(run_id)
@@ -44,6 +46,8 @@ class RagClient:
                 headers={"Authorization": "Bearer " + self.service_token, "X-Team-Id": str(context.team_id), "X-Run-Id": str(context.run_id), "X-Tool-Call-Id": tool_call_id},
                 json=request.model_dump(),
             )
+        except httpx.TimeoutException as exc:
+            raise RagError(503, ErrorCode.RAG_TIMEOUT) from exc
         except httpx.TransportError as exc:
             raise RagError(503, ErrorCode.RAG_UNAVAILABLE) from exc
         if response.is_error:
@@ -60,6 +64,8 @@ class RagClient:
                 self.base_url + "/v1/evidence/" + evidence_id,
                 headers={"Authorization": "Bearer " + self.service_token, "X-Team-Id": str(context.team_id), "X-Run-Id": str(context.run_id), "X-Tool-Call-Id": tool_call_id},
             )
+        except httpx.TimeoutException as exc:
+            raise RagError(503, ErrorCode.RAG_TIMEOUT) from exc
         except httpx.TransportError as exc:
             raise RagError(503, ErrorCode.RAG_UNAVAILABLE) from exc
         if response.is_error:

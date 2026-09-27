@@ -26,11 +26,13 @@ python3.12 -m venv .venv
 | `RAG_REWRITE_URL` / `RAG_REWRITE_MODEL` / `RAG_REWRITE_KEY` | OpenAI 兼容 Chat Completions 改写端点；缺失或临时失败时用原 query 并记录降级 |
 | `RAG_RERANK_URL` / `RAG_RERANK_MODEL` / `RAG_RERANK_KEY` | 独立 `/rerank` 服务，默认模型名 `bge-reranker-v2-m3`；临时失败时保留 RRF 排序 |
 | `RAG_MODEL_TIMEOUT_SECONDS` | 模型 HTTP 单次超时，默认 30 秒 |
+| `AGENT_RAG_TIMEOUT_SECONDS` | Agent→RAG HTTP 读、写及连接池等待超时，默认 120 秒；连接等待固定最多 5 秒 |
 | `RAG_BASE_URL` | Agent Worker 使用的 RAG API 根地址 |
 | `AGENT_MODEL_URL` / `AGENT_MODEL` / `AGENT_MODEL_KEY` | OpenAI 兼容 Chat Completions 服务根地址、模型名和 Key；根地址可含或不含 `/v1` |
+| `AGENT_MODEL_TIMEOUT_SECONDS` | Agent 模型请求超时，默认 120 秒；适用于 ReAct、规划和最终生成 |
 | `APP_REVISION` | 可选的部署版本标识；优先写入 Run Execution Manifest，未设置时回退到 Git HEAD，最后使用 `unknown` |
 | `AGENT_QUEUE_TIMEOUT_SECONDS` | Run 排队期限，默认 60 秒 |
-| `AGENT_EXECUTION_TIMEOUT_SECONDS` | 首次认领后的总墙钟期限，默认 300 秒；模型与工具等待均计入，单次外部调用不另设超时 |
+| `AGENT_EXECUTION_TIMEOUT_SECONDS` | 首次认领后的总墙钟期限，默认 300 秒；模型与工具等待均计入，期限到达后父 Worker 终止子进程 |
 | `AGENT_MAX_CONCURRENT_RUNS` | 所有父 Worker 共用的数据库全局并发上限，默认 2 |
 | `AGENT_LEASE_SECONDS` / `AGENT_HEARTBEAT_SECONDS` | 执行租约与父 Worker 心跳周期，默认 120/30 秒 |
 | `AGENT_TOOL_PROVIDERS` | Worker 启用的服务端工具提供者，逗号分隔的 `module:factory`；默认只加载 RAG 证据工具 |
@@ -125,9 +127,21 @@ curl -X POST http://127.0.0.1:8002/v1/runs \
   -d '{"task":"查证资料中的保留期限并说明依据","mode":"plan_execute"}'
 curl http://127.0.0.1:8002/v1/runs/RUN_UUID -H "Authorization: Bearer $TEAM_KEY"
 curl -X POST http://127.0.0.1:8002/v1/runs/RUN_UUID/cancel -H "Authorization: Bearer $TEAM_KEY"
+curl 'http://127.0.0.1:8002/v1/runs?status=queued&limit=30' -H "Authorization: Bearer $TEAM_KEY"
 ```
 
-父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。首次认领与状态变更在同一事务中写入不可变的 Execution Manifest，记录部署 revision、执行图/提示集版本、模型非秘密配置摘要、工具提供者和预算；恢复认领不会覆盖它。Manifest 不保存模型 Key、RAG token 或完整模型 URL。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。只有已经显式确认写入 LangGraph checkpoint 的调用才允许恢复；失租时若存在结果未知或尚未确认持久化的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
+`GET /v1/runs` 只列出凭据所属团队的 Run。`GET /v1/admin/runs` 需要管理 Key，可选 `team_id` 筛选全平台 Run；两个列表都支持 `status`、`created_after`、`created_before`，时间参数必须带时区，边界为不包含端点。列表按 `(created_at DESC, id DESC)` 排序，`limit` 默认 30、最大 100。响应为 `{"items":[...],"next_cursor":"..."}`；下一页原样使用 `next_cursor` 作为 `cursor`，并保持所有筛选条件不变。末页的游标为 `null`，不计算总数。每项只含 `id`、`mode`、`status`、`created_at`、`started_at`、`finished_at`、`error_code`；管理列表另含 `team_id`。游标格式无效或与筛选条件不符时返回 422。
+
+```sh
+curl 'http://127.0.0.1:8002/v1/admin/runs?team_id=TEAM_UUID&status=running&limit=30' -H "Authorization: Bearer $ADMIN_KEY"
+curl http://127.0.0.1:8002/v1/admin/runs/summary -H "Authorization: Bearer $ADMIN_KEY"
+```
+
+管理概览返回 `queued_within_deadline`、`queued_past_deadline`、`running_lease_valid`、`running_lease_expired`、`cancelling` 五项数量，以及 `oldest_claimable_created_at`（无可认领 Run 时为 `null`）。它按查询时数据库中已持久化的状态统计；读取不会结算超时、估算精确队列位置或判断 Worker 是否在线。
+
+父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。首次认领与状态变更在同一事务中写入不可变的 Execution Manifest，记录部署 revision、执行图/提示集版本、模型非秘密配置摘要、工具提供者、预算及两个调用超时值；恢复认领沿用快照，旧 Manifest 缺少超时字段时使用当前配置。两个超时配置只接受有限正数，Worker 启动时验证。Manifest 不保存模型 Key、RAG token 或完整模型 URL。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。只有已经显式确认写入 LangGraph checkpoint 的调用才允许恢复；失租时若存在结果未知或尚未确认持久化的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
+
+RAG 搜索可能依次等待查询改写、Embedding 和精排；RAG 服务内部这三步仍使用各自的 30 秒模型超时与降级流程。Agent 的 HTTP 网络超时按连接及读写等阶段计时，不保证严格的整次调用墙钟上限；Run 总期限继续提供最终墙钟限制。模型超时使 Run 以 `MODEL_TIMEOUT` 失败；RAG 搜索超时按不可用降级，工具 trace 记 `RAG_TIMEOUT`。超时只表示调用方未及时收到结果，不证明远端未执行，因此不会自动重试。
 
 管理 Key 可读取原始业务 trace，也可读取安全的确定性时间线。Timeline 只聚合 Agent schema，不在线查询 RAG；`retrieval_id`、`service_request_id` 和 `tool_call_id` 用于离线关联。旧 Run 没有 Manifest 时返回 `manifest: null`，时间线不返回 task、最终 answer、原始 prompt、工具原始参数或证据正文：
 
@@ -158,10 +172,14 @@ Agent 核心通过服务端工具提供者注册表加载工具，并对所有�
 ```sh
 curl http://127.0.0.1:8001/health
 curl http://127.0.0.1:8002/health
+curl http://127.0.0.1:8001/health/ready
+curl http://127.0.0.1:8002/health/ready
 ```
+
+`/health` 只表示 API 进程存活，保持原有响应。`/health/ready` 是轻量就绪检查：数据库连接、必要表及身份表可读时，Agent 返回 `{"service":"agent","status":"ok"}`；RAG 还要求服务 token 已配置且 active index 指针有效。不可用时返回 503，`status` 为 `unavailable`，不输出连接信息或异常详情。探测有短连接和查询超时，不调用模型或完整 `db.doctor`，也不检查 Worker 在线情况。
 
 使用专用测试数据库及上述四个 DSN 执行 `.venv/bin/pytest -q`。测试在数据库中创建随机命名团队、凭据、Run 和合成文档；请勿指向生产库。无数据库变量时数据库测试会跳过。Agent 的 RAG 适配器只通过 HTTP/JSON 契约交互，从持久 Run 读取可信团队 ID。React、Plan-and-Execute、checkpoint、预算和结果发布使用脚本化模型验证；真实模型端点以及真实 Embedding、改写和精排服务的效果尚未验证。数据流见 [架构图](docs/architecture.md)。
 
-已有部署升级时必须先升级数据结构，再部署依赖新表和字段的代码：运行 `python -m db.migrate`；新环境再执行 checkpoint setup（已有 checkpoint 表无需重建）；随后重复运行 `python -m db.bootstrap` 收紧 Manifest 权限；确认 `python -m db.doctor` 无 ERROR；最后部署 API 和 Worker。旧代码可继续使用新 schema，新增迁移的 downgrade 只移除 Manifest 与检索审计元数据，不删除核心 Run、结果、文档或证据。
+已有部署升级时必须先升级数据结构，再部署新 API：运行 `python -m db.migrate`，其中 Agent 链的 `agent_0005` 迁移会建立团队与管理员列表排序索引；新环境再执行 checkpoint setup（已有 checkpoint 表无需重建）。本次调用超时无需新增表或迁移。现有数据库权限模型无需改变；若尚未完成以往版本的角色授权，再运行 `python -m db.bootstrap`。确认 `python -m db.doctor` 无 ERROR 后先部署包含新错误码的 Agent API，再部署 Agent Worker，避免旧 API 无法解析新 Run 错误码。旧代码可继续使用新 schema；`agent_0005` 的 downgrade 仅删除两个列表索引。
 
 可复现的本地 HTTP Mock 全链路步骤见 [合成资料演示](docs/synthetic-demo.md)。该流程已覆盖受限资料上传、Worker 索引、混合检索、两种 Agent 模式、工具调用和引用快照；Mock 固定输出只用于工程验收，不代表真实检索或模型效果。

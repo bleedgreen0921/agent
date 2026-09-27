@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from agent_service.runtime import child_exited, claim_run, control_state, heartbeat, revoke_and_finish
+from agent_service.timeouts import configured_timeouts
 
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ def terminate(child: Child) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    configured_timeouts()
     context = mp.get_context("spawn")
     children: dict[UUID, Child] = {}
     slots = int(os.environ.get("AGENT_MAX_CONCURRENT_RUNS", "2"))

@@ -111,8 +111,12 @@ def _call_rag(client: RagClient, operation: str, run_id):
 
 
 @pytest.mark.parametrize("operation", ["search", "read"])
-@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
-def test_rag_adapter_translates_transport_errors(monkeypatch, operation, error_type):
+@pytest.mark.parametrize("error_type,expected_code", [
+    (httpx.ConnectError, ErrorCode.RAG_UNAVAILABLE),
+    (httpx.ConnectTimeout, ErrorCode.RAG_TIMEOUT),
+    (httpx.ReadTimeout, ErrorCode.RAG_TIMEOUT),
+])
+def test_rag_adapter_translates_transport_errors(monkeypatch, operation, error_type, expected_code):
     run_id, team_id = uuid4(), uuid4()
     monkeypatch.setattr(TrustedRunContext, "from_persisted_run", classmethod(lambda cls, value: cls(value, team_id)))
 
@@ -124,7 +128,7 @@ def test_rag_adapter_translates_transport_errors(monkeypatch, operation, error_t
     with http_client, pytest.raises(RagError) as exc:
         _call_rag(client, operation, run_id)
     assert exc.value.status == 503
-    assert exc.value.code == ErrorCode.RAG_UNAVAILABLE
+    assert exc.value.code == expected_code
 
 
 @pytest.mark.parametrize("operation", ["search", "read"])
@@ -150,13 +154,14 @@ def test_rag_adapter_translates_non_contract_responses(monkeypatch, operation, s
     assert exc.value.code == expected_code
 
 
-def test_rag_adapter_default_client_has_no_timeout():
+def test_rag_adapter_default_client_has_bounded_timeout(monkeypatch):
+    monkeypatch.setenv("AGENT_RAG_TIMEOUT_SECONDS", "12.5")
     client = RagClient("http://rag.test", "service-secret")
     try:
-        assert client.client.timeout.connect is None
-        assert client.client.timeout.read is None
-        assert client.client.timeout.write is None
-        assert client.client.timeout.pool is None
+        assert client.client.timeout.connect == 5
+        assert client.client.timeout.read == 12.5
+        assert client.client.timeout.write == 12.5
+        assert client.client.timeout.pool == 12.5
     finally:
         client.client.close()
 
@@ -164,7 +169,7 @@ def test_rag_adapter_default_client_has_no_timeout():
 @pytest.mark.skipif(not os.environ.get("IDENTITY_ADMIN_DATABASE_URL"), reason="isolated PostgreSQL not configured")
 def test_migrations_permissions_and_key_lifecycle():
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
-        for schema, version in (("identity", "identity_0001"), ("rag", "rag_0003"), ("agent", "agent_0004")):
+        for schema, version in (("identity", "identity_0001"), ("rag", "rag_0003"), ("agent", "agent_0005")):
             assert conn.execute(f"SELECT version_num FROM {schema}.alembic_version").fetchone()[0] == version
         assert conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
     with connect("RAG_DATABASE_URL") as conn:

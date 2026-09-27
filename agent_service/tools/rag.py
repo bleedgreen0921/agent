@@ -24,7 +24,7 @@ def fatal_error(exc: RagError) -> FatalToolError | None:
 def search_evidence(query: str, runtime: ToolRuntime[ToolExecutionContext], top_k: int = 5) -> str:
     """Search the configured evidence service for material relevant to a query."""
     context = runtime.context
-    client = RagClient(os.environ["RAG_BASE_URL"], os.environ["RAG_SERVICE_TOKEN"])
+    client = RagClient(os.environ["RAG_BASE_URL"], os.environ["RAG_SERVICE_TOKEN"], timeout_seconds=context.rag_timeout_seconds)
     try:
         response = client.search(context.run_id, str(context.business_call_id(runtime.tool_call_id)), EvidenceSearchRequest(query=query, top_k=top_k))
         for item in response.evidences:
@@ -45,7 +45,7 @@ def search_evidence(query: str, runtime: ToolRuntime[ToolExecutionContext], top_
         fatal = fatal_error(exc)
         if fatal:
             raise fatal from exc
-        if exc.code == ErrorCode.RAG_UNAVAILABLE:
+        if exc.code in {ErrorCode.RAG_UNAVAILABLE, ErrorCode.RAG_TIMEOUT}:
             context.notices.append({"code": "RAG_UNAVAILABLE", "message": "Knowledge retrieval is temporarily unavailable; contact an administrator if it persists."})
             context.add_tool_metadata(runtime.tool_call_id, status="degraded", result_summary={"status": "unavailable"}, error_code=str(exc.code))
             return json.dumps({"status": "unavailable", "evidences": []})
@@ -59,7 +59,7 @@ def search_evidence(query: str, runtime: ToolRuntime[ToolExecutionContext], top_
 def read_evidence(evidence_id: str, runtime: ToolRuntime[ToolExecutionContext]) -> str:
     """Read one evidence fragment from the configured evidence service."""
     context = runtime.context
-    client = RagClient(os.environ["RAG_BASE_URL"], os.environ["RAG_SERVICE_TOKEN"])
+    client = RagClient(os.environ["RAG_BASE_URL"], os.environ["RAG_SERVICE_TOKEN"], timeout_seconds=context.rag_timeout_seconds)
     try:
         item = client.read(context.run_id, str(context.business_call_id(runtime.tool_call_id)), evidence_id)
         context.evidence[item.evidence_id] = item.model_dump(exclude_none=True)

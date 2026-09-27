@@ -5,10 +5,12 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 
 from agent_service.manifest import execution_manifest, schema_version
+from agent_service.timeouts import configured_timeouts
 from db.connection import connect
 
 
 def claim_run() -> dict | None:
+    configured_timeouts()
     lease_seconds = int(os.environ.get("AGENT_LEASE_SECONDS", "120"))
     execution_seconds = int(os.environ.get("AGENT_EXECUTION_TIMEOUT_SECONDS", "300"))
     concurrency = int(os.environ.get("AGENT_MAX_CONCURRENT_RUNS", "2"))
@@ -45,11 +47,12 @@ def claim_run() -> dict | None:
             return None
         token = uuid4()
         first = row["started_at"] is None
-        conn.execute(
-            """INSERT INTO agent.run_manifests(run_id,schema_version,manifest)
-            VALUES (%s,%s,%s) ON CONFLICT (run_id) DO NOTHING""",
-            (row["id"], schema_version(), Jsonb(execution_manifest())),
-        )
+        if first:
+            conn.execute(
+                """INSERT INTO agent.run_manifests(run_id,schema_version,manifest)
+                VALUES (%s,%s,%s) ON CONFLICT (run_id) DO NOTHING""",
+                (row["id"], schema_version(), Jsonb(execution_manifest())),
+            )
         conn.execute("""UPDATE agent.agent_runs SET status='running',lease_token=%s,
             leased_until=now()+(%s * interval '1 second'),heartbeat_at=now(),
             started_at=COALESCE(started_at,now()),
@@ -171,6 +174,7 @@ def settle_model(run_id: UUID, token: UUID, call_id: UUID, status: str, *, input
             output_tokens=%s,output_summary=%s,error_code=%s
             FROM agent.agent_runs r WHERE c.id=%s AND c.run_id=%s AND c.status='started'
               AND r.id=c.run_id AND r.lease_token=%s AND r.status='running'
+              AND r.leased_until>now() AND r.execution_deadline_at>now()
             RETURNING c.id""", (status, input_tokens, output_tokens, Jsonb(output_summary) if output_summary is not None else None, error_code, call_id, run_id, token)).fetchone()
     return bool(row)
 
@@ -181,6 +185,7 @@ def settle_tool(run_id: UUID, token: UUID, call_id: UUID, status: str, *, result
             service_request_id=%s,retrieval_id=%s,evidence_ids=%s,error_code=%s
             FROM agent.agent_runs r WHERE c.id=%s AND c.run_id=%s AND c.status='started'
               AND r.id=c.run_id AND r.lease_token=%s AND r.status='running'
+              AND r.leased_until>now() AND r.execution_deadline_at>now()
             RETURNING c.id""", (status, Jsonb(result_summary) if result_summary is not None else None, service_request_id, retrieval_id, Jsonb(evidence_ids or []), error_code, call_id, run_id, token)).fetchone()
     return bool(row)
 
@@ -189,7 +194,9 @@ def fail_run(run_id: UUID, token: UUID, code: str, reason: str | None = None) ->
     with connect("AGENT_DATABASE_URL") as conn:
         row = conn.execute("""UPDATE agent.agent_runs SET status='failed',error_code=%s,
             termination_reason=%s,finished_at=now(),lease_token=NULL,leased_until=NULL
-            WHERE id=%s AND lease_token=%s AND status='running' RETURNING id""", (code, reason or code.lower(), run_id, token)).fetchone()
+            WHERE id=%s AND lease_token=%s AND status='running'
+              AND leased_until>now() AND execution_deadline_at>now()
+            RETURNING id""", (code, reason or code.lower(), run_id, token)).fetchone()
     return bool(row)
 
 
