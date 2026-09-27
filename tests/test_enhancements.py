@@ -186,9 +186,10 @@ def test_rag_search_audit_hashes_results_and_errors(monkeypatch):
     ]
     monkeypatch.setattr(retrieval, "rewrite", lambda value: rewritten)
     monkeypatch.setattr(retrieval, "embed", lambda *args: [[0.1] * 1024])
-    monkeypatch.setattr(retrieval, "_dense", lambda *args: rows)
+    monkeypatch.setattr(retrieval, "_dense", lambda *args: [dict(row, distance=0.1 * index) for index, row in enumerate(rows)])
     monkeypatch.setattr(retrieval, "_sparse", lambda *args: [])
-    monkeypatch.setattr(retrieval, "rerank", lambda _query, _contents: [1, 0])
+    monkeypatch.setattr(retrieval, "rerank", lambda _query, _contents: [
+        {"index": 1, "score": 0.9}, {"index": 0, "score": 0.1}])
     response = retrieval.search(retrieval.EvidenceSearchRequest(query=query, top_k=2), team_id, "run_audit", "tool_audit")
     expected_ids = ["ev_" + str(chunk_ids[1]), "ev_" + str(chunk_ids[0])]
     assert [item["evidence_id"] for item in response["evidences"]] == expected_ids
@@ -198,6 +199,9 @@ def test_rag_search_audit_hashes_results_and_errors(monkeypatch):
     assert row["query_sha256"] == hashlib.sha256(query.encode()).hexdigest()
     assert row["rewritten_query_sha256"] == hashlib.sha256(rewritten.encode()).hexdigest()
     assert row["selected_evidence_ids"] == expected_ids
+    assert row["candidate_trace"]["version"] == 1
+    assert row["candidate_trace"]["stages"]["rerank"]["candidates"][0] == {
+        "evidence_id": expected_ids[0], "rank": 1, "score": 0.9}
     assert query not in json.dumps(dict(row), default=str)
 
     error_run, error_tool = "run_" + uuid4().hex, "tool_" + uuid4().hex
@@ -205,8 +209,12 @@ def test_rag_search_audit_hashes_results_and_errors(monkeypatch):
     with pytest.raises(ApiError):
         retrieval.search(retrieval.EvidenceSearchRequest(query="failure"), team_id, error_run, error_tool)
     with connect("RAG_DATABASE_URL") as conn:
-        failed = conn.execute("SELECT operation,selected_evidence_ids,error_code FROM rag.retrieval_audit WHERE run_id=%s AND tool_call_id=%s", (error_run, error_tool)).fetchone()
-    assert failed == {"operation": "search", "selected_evidence_ids": [], "error_code": "EMBEDDING_NOT_CONFIGURED"}
+        failed = conn.execute("SELECT operation,selected_evidence_ids,error_code,candidate_trace FROM rag.retrieval_audit WHERE run_id=%s AND tool_call_id=%s", (error_run, error_tool)).fetchone()
+    assert failed["operation"] == "search"
+    assert failed["selected_evidence_ids"] == []
+    assert failed["error_code"] == "EMBEDDING_NOT_CONFIGURED"
+    assert failed["candidate_trace"]["stages"]["dense"]["status"] == "unavailable"
+    assert failed["candidate_trace"]["stages"]["fts"]["status"] == "not_executed"
 
 
 @pytest.mark.skipif(not HAS_DATABASE, reason="isolated PostgreSQL not configured")
@@ -226,8 +234,8 @@ def test_rag_evidence_read_audit_success_and_not_found():
     with pytest.raises(ApiError):
         retrieval.read_evidence("ev_" + str(uuid4()), team_id, missing_run, missing_tool)
     with connect("RAG_DATABASE_URL") as conn:
-        success = conn.execute("SELECT operation,retrieval_id,query_sha256,rewritten_query_sha256,selected_evidence_ids,error_code FROM rag.retrieval_audit WHERE run_id=%s AND tool_call_id=%s", (run_id, tool_id)).fetchone()
-        missing = conn.execute("SELECT operation,selected_evidence_ids,error_code FROM rag.retrieval_audit WHERE run_id=%s AND tool_call_id=%s", (missing_run, missing_tool)).fetchone()
+        success = conn.execute("SELECT operation,retrieval_id,query_sha256,rewritten_query_sha256,selected_evidence_ids,error_code,candidate_trace FROM rag.retrieval_audit WHERE run_id=%s AND tool_call_id=%s", (run_id, tool_id)).fetchone()
+        missing = conn.execute("SELECT operation,selected_evidence_ids,error_code,candidate_trace FROM rag.retrieval_audit WHERE run_id=%s AND tool_call_id=%s", (missing_run, missing_tool)).fetchone()
     assert success == {
         "operation": "read",
         "retrieval_id": None,
@@ -235,8 +243,9 @@ def test_rag_evidence_read_audit_success_and_not_found():
         "rewritten_query_sha256": None,
         "selected_evidence_ids": [evidence_id],
         "error_code": None,
+        "candidate_trace": None,
     }
-    assert missing == {"operation": "read", "selected_evidence_ids": [], "error_code": "EVIDENCE_NOT_FOUND"}
+    assert missing == {"operation": "read", "selected_evidence_ids": [], "error_code": "EVIDENCE_NOT_FOUND", "candidate_trace": None}
     with connect("RAG_DATABASE_URL") as conn:
         conn.execute("UPDATE rag.documents SET active_version_id=NULL WHERE id=%s", (document_id,))
         conn.execute("DELETE FROM rag.chunks WHERE document_id=%s", (document_id,))

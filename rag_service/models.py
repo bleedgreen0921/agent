@@ -37,7 +37,7 @@ def embed(texts: list[str], model: str, dimensions: int) -> list[list[float]]:
         raise ModelFailure("EMBEDDING_RESPONSE_INVALID", False) from exc
 
 
-def rerank(query: str, contents: list[str]) -> list[int]:
+def rerank(query: str, contents: list[str]) -> list[dict]:
     url = os.environ.get("RAG_RERANK_URL", "").rstrip("/")
     if not url:
         raise ModelFailure("RERANK_UNAVAILABLE")
@@ -49,9 +49,13 @@ def rerank(query: str, contents: list[str]) -> list[int]:
         if len(results) != len(contents):
             raise ValueError
         indices = [item["index"] for item in results]
-        if set(indices) != set(range(len(contents))) or any(not math.isfinite(item["relevance_score"]) for item in results):
+        if (set(indices) != set(range(len(contents))) or any(
+            not isinstance(item["relevance_score"], (int, float)) or
+            not math.isfinite(item["relevance_score"]) for item in results
+        )):
             raise ValueError
-        return [item["index"] for item in sorted(results, key=lambda item: -item["relevance_score"])]
+        return [{"index": item["index"], "score": item["relevance_score"]}
+                for item in sorted(results, key=lambda item: -item["relevance_score"])]
     except ModelFailure:
         raise
     except httpx.TransportError as exc:

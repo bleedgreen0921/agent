@@ -30,22 +30,25 @@ def _dense(conn, team_id: UUID, revision: dict, vector: list[float]) -> list[dic
     dimension = int(revision["dimensions"])
     if not 1 <= dimension <= 4096:
         raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Index configuration invalid")
-    query = f"""SELECT c.id,c.document_id,c.version_id,c.content,c.source_locator,d.title
+    query = f"""SELECT c.id,c.document_id,c.version_id,c.content,c.source_locator,d.title,
+        e.embedding::vector({dimension}) <=> %s::vector({dimension}) AS distance
         FROM rag.embeddings e JOIN rag.chunks c ON c.id=e.chunk_id
         JOIN rag.documents d ON d.id=c.document_id
         WHERE e.revision_id=%s AND {VISIBLE}
         ORDER BY e.embedding::vector({dimension}) <=> %s::vector({dimension}), c.id LIMIT 50"""
-    return conn.execute(query, (revision["id"], team_id, vector_literal(vector))).fetchall()
+    literal = vector_literal(vector)
+    return conn.execute(query, (literal, revision["id"], team_id, literal)).fetchall()
 
 
 def _sparse(conn, team_id: UUID, query: str) -> list[dict]:
     terms = sparse_terms(query)
     if not terms:
         return []
-    return conn.execute(f"""SELECT c.id,c.document_id,c.version_id,c.content,c.source_locator,d.title
+    return conn.execute(f"""SELECT c.id,c.document_id,c.version_id,c.content,c.source_locator,d.title,
+        ts_rank_cd(c.search_vector,plainto_tsquery('simple',%s)) AS score
         FROM rag.chunks c JOIN rag.documents d ON d.id=c.document_id
         WHERE {VISIBLE} AND c.search_vector @@ plainto_tsquery('simple',%s)
-        ORDER BY ts_rank_cd(c.search_vector,plainto_tsquery('simple',%s)) DESC,c.id LIMIT 50""", (team_id, terms, terms)).fetchall()
+        ORDER BY score DESC,c.id LIMIT 50""", (terms, team_id, terms)).fetchall()
 
 
 def _sha256(value: str) -> str:
@@ -68,17 +71,19 @@ def _audit(
     rewritten_query_sha256: str | None = None,
     selected_evidence_ids: list[str] | None = None,
     error_code: str | None = None,
+    candidate_trace: dict | None = None,
 ) -> None:
     with connect("RAG_DATABASE_URL") as conn:
         conn.execute("""INSERT INTO rag.retrieval_audit(
             id,request_id,run_id,tool_call_id,team_id,revision_id,status,degradations,evidence_id,
-            operation,retrieval_id,query_sha256,rewritten_query_sha256,selected_evidence_ids,error_code)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
+            operation,retrieval_id,query_sha256,rewritten_query_sha256,selected_evidence_ids,error_code,candidate_trace)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
                 uuid4(), request_id, run_id, tool_call_id, team_id, revision_id, status,
                 Jsonb(degradations), evidence_id, operation, retrieval_id, query_sha256,
                 rewritten_query_sha256,
                 Jsonb(selected_evidence_ids) if selected_evidence_ids is not None else None,
                 error_code,
+                Jsonb(candidate_trace) if candidate_trace is not None else None,
             ))
 
 
@@ -94,6 +99,11 @@ def search(request: EvidenceSearchRequest, team_id: UUID, run_id: str, tool_call
     degradations: list[str] = []
     query_sha256 = _sha256(request.query)
     rewritten_query_sha256 = query_sha256
+    stages = {name: {"status": "not_executed", "candidates": []}
+              for name in ("dense", "fts", "fusion", "rerank")}
+    stages["rewrite"] = {"status": "not_executed"}
+    stages["rerank"]["input_evidence_ids"] = []
+    candidate_trace = {"version": 1, "top_k": request.top_k, "stages": stages}
 
     def audit(status: str, revision_id: UUID | None, selected: list[str], error_code: str | None = None) -> None:
         _audit(
@@ -110,6 +120,7 @@ def search(request: EvidenceSearchRequest, team_id: UUID, run_id: str, tool_call
             rewritten_query_sha256=rewritten_query_sha256,
             selected_evidence_ids=selected,
             error_code=error_code,
+            candidate_trace=candidate_trace,
         )
 
     try:
@@ -121,29 +132,41 @@ def search(request: EvidenceSearchRequest, team_id: UUID, run_id: str, tool_call
     try:
         dense_query = rewrite(request.query)
         rewritten_query_sha256 = _sha256(dense_query)
+        stages["rewrite"]["status"] = "success"
     except ModelFailure:
         dense_query = request.query
         degradations.append("QUERY_REWRITE_FALLBACK")
+        stages["rewrite"]["status"] = "unavailable"
     try:
         vector = embed([f"Instruct: Given a user question, retrieve relevant passages that answer the question\nQuery: {dense_query}"], revision["model"], revision["dimensions"])[0]
         with connect("RAG_DATABASE_URL") as conn:
             dense = _dense(conn, team_id, revision, vector)
+        stages["dense"] = {"status": "success", "candidates": [
+            {"evidence_id": "ev_" + str(row["id"]), "rank": rank, "distance": row["distance"]}
+            for rank, row in enumerate(dense, 1)]}
     except ModelFailure as exc:
+        stages["dense"]["status"] = "unavailable"
         if not exc.retryable:
             audit("unavailable", revision["id"], [], exc.code)
             raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Embedding configuration unavailable") from exc
         dense = None
         degradations.append("DENSE_UNAVAILABLE")
     except ApiError:
+        stages["dense"]["status"] = "unavailable"
         audit("unavailable", revision["id"], [], "INDEX_CONFIGURATION_INVALID")
         raise
     except psycopg.OperationalError:
+        stages["dense"]["status"] = "unavailable"
         dense = None
         degradations.append("DENSE_UNAVAILABLE")
     try:
         with connect("RAG_DATABASE_URL") as conn:
             sparse = _sparse(conn, team_id, request.query)
+        stages["fts"] = {"status": "success", "candidates": [
+            {"evidence_id": "ev_" + str(row["id"]), "rank": rank, "score": row["score"]}
+            for rank, row in enumerate(sparse, 1)]}
     except psycopg.OperationalError:
+        stages["fts"]["status"] = "unavailable"
         sparse = None
         degradations.append("FTS_UNAVAILABLE")
     if dense is None and sparse is None:
@@ -155,12 +178,22 @@ def search(request: EvidenceSearchRequest, team_id: UUID, run_id: str, tool_call
         for rank, row in enumerate(results, 1):
             rows[row["id"]] = row
             scores[row["id"]] = scores.get(row["id"], 0) + 1 / (60 + rank)
-    ordered = sorted(rows, key=lambda item: (-scores[item], str(item)))[:40]
+    fused = sorted(rows, key=lambda item: (-scores[item], str(item)))
+    stages["fusion"] = {"status": "success", "candidates": [
+        {"evidence_id": "ev_" + str(item), "rank": rank, "rrf_score": scores[item]}
+        for rank, item in enumerate(fused, 1)]}
+    ordered = fused[:40]
     if ordered:
+        stages["rerank"]["input_evidence_ids"] = ["ev_" + str(item) for item in ordered]
         try:
-            indices = rerank(request.query, [rows[item]["content"] for item in ordered])
-            ordered = [ordered[index] for index in indices]
+            ranked = rerank(request.query, [rows[item]["content"] for item in ordered])
+            stages["rerank"]["status"] = "success"
+            stages["rerank"]["candidates"] = [
+                {"evidence_id": "ev_" + str(ordered[item["index"]]), "rank": rank, "score": item["score"]}
+                for rank, item in enumerate(ranked, 1)]
+            ordered = [ordered[item["index"]] for item in ranked]
         except ModelFailure as exc:
+            stages["rerank"]["status"] = "unavailable"
             if not exc.retryable:
                 audit("unavailable", revision["id"], [], exc.code)
                 raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Reranker configuration unavailable") from exc

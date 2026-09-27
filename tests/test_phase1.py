@@ -169,7 +169,7 @@ def test_rag_adapter_default_client_has_bounded_timeout(monkeypatch):
 @pytest.mark.skipif(not os.environ.get("IDENTITY_ADMIN_DATABASE_URL"), reason="isolated PostgreSQL not configured")
 def test_migrations_permissions_and_key_lifecycle():
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
-        for schema, version in (("identity", "identity_0002"), ("rag", "rag_0003"), ("agent", "agent_0007")):
+        for schema, version in (("identity", "identity_0002"), ("rag", "rag_0004"), ("agent", "agent_0007")):
             assert conn.execute(f"SELECT version_num FROM {schema}.alembic_version").fetchone()[0] == version
         assert conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
     with connect("RAG_DATABASE_URL") as conn:

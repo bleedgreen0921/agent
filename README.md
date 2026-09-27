@@ -174,9 +174,10 @@ RAG 搜索可能依次等待查询改写、Embedding 和精排；RAG 服务内�
 curl http://127.0.0.1:8002/v1/admin/runs/RUN_UUID/trace -H "Authorization: Bearer $ADMIN_KEY"
 curl http://127.0.0.1:8002/v1/admin/runs/RUN_UUID/timeline -H "Authorization: Bearer $ADMIN_KEY"
 .venv/bin/python -m db.trace_run RUN_UUID
+.venv/bin/python -m db.trace_run RUN_UUID --include-candidates
 ```
 
-`db.trace_run` 分别使用 `AGENT_DATABASE_URL` 和 `RAG_DATABASE_URL` 的只读事务，输出单 Run 的稳定 JSON：Agent 时间线 ID、工具调用与 RAG 审计关联、查询哈希、证据 ID、最终 claim 序号及引用。缺少下游审计或无法匹配的审计标记为“未观测到关联记录”；该标记不推断远端是否执行。命令不输出 task、答案、claim 文本、prompt、查询或证据正文；数据库不可用时以非零状态退出，不输出追踪 JSON。运行角色的权限限制仍适用。
+`db.trace_run` 分别使用 `AGENT_DATABASE_URL` 和 `RAG_DATABASE_URL` 的只读事务，输出 v2 JSON：Agent 时间线 ID、claim → 证据 ID → 所有记录该证据的工具调用 → RAG 审计 ID，以及查询哈希、索引 revision、降级信息和检索阶段状态及候选数量。关联标为 `matched`、`fields_missing`、`conflict` 或“未观测到关联记录”；冲突记录仍显示，但不视为已核实。默认输出省略候选详情；`--include-candidates` 展示 Dense 前 50、FTS 前 50、完整融合候选及精排前 40 的 ID、名次和分数。旧审计行和读取证据审计显示“未记录候选过程”。命令不输出 task、答案、claim 文本、prompt、查询或证据正文；数据库不可用时以非零状态退出，不输出追踪 JSON。运行角色的权限限制仍适用。部署时先应用 `rag_0004` 可空字段迁移，再部署 RAG 服务，最后部署新版追踪命令。
 
 ```sh
 .venv/bin/python -m agent_service.worker

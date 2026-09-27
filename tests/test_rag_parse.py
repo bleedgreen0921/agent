@@ -99,7 +99,8 @@ def test_model_http_contracts(monkeypatch):
 
     monkeypatch.setenv("RAG_RERANK_URL", "http://rerank.test")
     monkeypatch.setattr(models, "_client", lambda: httpx.Client(transport=httpx.MockTransport(rerank_handler)))
-    assert models.rerank("question", ["low", "high"]) == [1, 0]
+    assert models.rerank("question", ["low", "high"]) == [
+        {"index": 1, "score": 0.9}, {"index": 0, "score": 0.1}]
 
 
 @pytest.mark.parametrize(

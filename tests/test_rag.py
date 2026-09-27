@@ -35,7 +35,8 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "make_chunks", lambda blocks, title: [ChunkDraft(blocks[0].text, (), blocks[0].locator)])
     monkeypatch.setattr(worker, "embed", lambda texts, model, dimensions: [[0.1] * dimensions for _ in texts])
     monkeypatch.setattr(retrieval, "embed", lambda texts, model, dimensions: [[0.1] * dimensions for _ in texts])
-    monkeypatch.setattr(retrieval, "rerank", lambda query, contents: list(range(len(contents))))
+    monkeypatch.setattr(retrieval, "rerank", lambda query, contents: [
+        {"index": index, "score": float(len(contents) - index)} for index in range(len(contents))])
     monkeypatch.setattr(retrieval, "rewrite", lambda query: query)
     admin, teams = _admin_and_teams()
     with TestClient(app) as client:
@@ -54,6 +55,13 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
         search = client.post("/v1/evidence/search", headers=_service(teams[0]), json={"query": "alpha"})
         assert search.status_code == 200, search.text
         evidence = search.json()["evidences"][0]
+        with connect("RAG_DATABASE_URL") as conn:
+            trace = conn.execute("SELECT candidate_trace FROM rag.retrieval_audit WHERE retrieval_id=%s",
+                                 (search.json()["retrieval_id"],)).fetchone()["candidate_trace"]
+        assert trace["stages"]["dense"]["candidates"][0]["evidence_id"] == evidence["evidence_id"]
+        assert isinstance(trace["stages"]["dense"]["candidates"][0]["distance"], float)
+        assert trace["stages"]["fts"]["candidates"][0]["evidence_id"] == evidence["evidence_id"]
+        assert isinstance(trace["stages"]["fts"]["candidates"][0]["score"], float)
         assert evidence["document_version_id"] == "ver_" + version_id
         assert client.get("/v1/evidence/" + evidence["evidence_id"], headers=_service(teams[0])).status_code == 200
         assert client.get("/v1/evidence/" + evidence["evidence_id"], headers=_service(teams[1])).status_code == 404
