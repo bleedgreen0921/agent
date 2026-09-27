@@ -14,7 +14,7 @@ def claim_run() -> dict | None:
     lease_seconds = int(os.environ.get("AGENT_LEASE_SECONDS", "120"))
     execution_seconds = int(os.environ.get("AGENT_EXECUTION_TIMEOUT_SECONDS", "300"))
     concurrency = int(os.environ.get("AGENT_MAX_CONCURRENT_RUNS", "2"))
-    with connect("AGENT_DATABASE_URL") as conn:
+    with connect("AGENT_DATABASE_URL", profile="control") as conn:
         conn.execute("SELECT pg_advisory_xact_lock(824731091)")
         conn.execute("""UPDATE agent.agent_runs SET status='failed',error_code='QUEUE_TIMEOUT',
             termination_reason='queue_timeout',finished_at=now()
@@ -87,7 +87,7 @@ def mark_interrupted(conn, run_id: UUID) -> None:
 
 def heartbeat(run_id: UUID, token: UUID) -> bool:
     lease_seconds = int(os.environ.get("AGENT_LEASE_SECONDS", "120"))
-    with connect("AGENT_DATABASE_URL") as conn:
+    with connect("AGENT_DATABASE_URL", profile="control") as conn:
         row = conn.execute("""UPDATE agent.agent_runs SET leased_until=now()+(%s * interval '1 second'),heartbeat_at=now()
             WHERE id=%s AND lease_token=%s AND status='running' AND execution_deadline_at>now()
             RETURNING id""", (lease_seconds, run_id, token)).fetchone()
@@ -95,7 +95,7 @@ def heartbeat(run_id: UUID, token: UUID) -> bool:
 
 
 def control_state(run_id: UUID, token: UUID) -> str:
-    with connect("AGENT_DATABASE_URL") as conn:
+    with connect("AGENT_DATABASE_URL", profile="control") as conn:
         row = conn.execute("SELECT status,execution_deadline_at,lease_token FROM agent.agent_runs WHERE id=%s", (run_id,)).fetchone()
     if not row or row["lease_token"] != token:
         return "lost"
@@ -108,7 +108,7 @@ def control_state(run_id: UUID, token: UUID) -> str:
 
 def revoke_and_finish(run_id: UUID, token: UUID, reason: str) -> None:
     status, error = ("cancelled", None) if reason == "cancel" else ("failed", "RUN_TIMEOUT")
-    with connect("AGENT_DATABASE_URL") as conn:
+    with connect("AGENT_DATABASE_URL", profile="control") as conn:
         row = conn.execute("SELECT id FROM agent.agent_runs WHERE id=%s AND lease_token=%s FOR UPDATE", (run_id, token)).fetchone()
         if not row:
             return
@@ -119,7 +119,7 @@ def revoke_and_finish(run_id: UUID, token: UUID, reason: str) -> None:
 
 
 def child_exited(run_id: UUID, token: UUID) -> None:
-    with connect("AGENT_DATABASE_URL") as conn:
+    with connect("AGENT_DATABASE_URL", profile="control") as conn:
         row = conn.execute("SELECT status FROM agent.agent_runs WHERE id=%s AND lease_token=%s FOR UPDATE", (run_id, token)).fetchone()
         if not row or row["status"] in {"completed", "partial", "failed", "cancelled"}:
             return

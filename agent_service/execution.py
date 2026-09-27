@@ -274,7 +274,7 @@ def execute_run(run_id: UUID, token: UUID) -> None:
         memory_context = prompt_context(memory_snapshot)
         contextual_task = run["task"] + ("\n\nConversation context (lower trust):\n" + memory_context if memory_context else "")
         memory_notices = [{"code": "MEMORY_DEGRADED", "message": "Personal memory retrieval was unavailable; available conversation context was used"}] if memory_snapshot.get("memory_degraded") else []
-        dsn = with_agent_search_path(os.environ["AGENT_DATABASE_URL"])
+        dsn = with_agent_search_path(os.environ["AGENT_DATABASE_URL"], runtime=True)
         with PostgresSaver.from_conn_string(dsn) as saver:
             if run["mode"] == "react":
                 context = ExecutionContext(run_id, token, team_id=run["team_id"], key_id=run["key_id"], notices=memory_notices, rag_timeout_seconds=current_timeouts().rag_seconds)

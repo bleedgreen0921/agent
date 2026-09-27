@@ -14,6 +14,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from db.migrate import ROOT
+from db.worker_status import snapshot
 
 
 SCHEMA_VERSION = 1
@@ -241,6 +242,15 @@ def check_memory_jobs() -> dict:
     return result("agent.memory_jobs", "pass", "Memory jobs have no expired leases or exhausted retries")
 
 
+def check_worker_status(service: str) -> dict:
+    state = snapshot(service)
+    unhealthy = state["overdue_count"] or state["expired_lease_count"] or (state["queued_count"] and not state["online_count"])
+    details = {key: state[key] for key in ("online_count", "queued_count", "overdue_count", "expired_lease_count")}
+    if unhealthy:
+        return result(f"{service}.worker_status", "warn", "Worker or task queue needs attention", details)
+    return result(f"{service}.worker_status", "pass", "Worker and queue status is consistent", details)
+
+
 def check_call_consistency() -> dict:
     with readonly_connection("AGENT_DATABASE_URL") as conn:
         terminal = conn.execute("""SELECT DISTINCT r.id FROM agent.agent_runs r
@@ -305,6 +315,8 @@ def run_checks() -> dict:
         _safe_check("rag.processing_leases", check_processing_leases),
         _safe_check("agent.run_leases", check_run_leases),
         _safe_check("agent.memory_jobs", check_memory_jobs),
+        _safe_check("agent.worker_status", lambda: check_worker_status("agent")),
+        _safe_check("rag.worker_status", lambda: check_worker_status("rag")),
         _safe_check("agent.call_consistency", check_call_consistency),
         _safe_check("rag.files_consistency", check_files_consistency),
     ]

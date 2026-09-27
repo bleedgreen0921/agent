@@ -49,6 +49,9 @@ def test_provider_contract_and_manifest(monkeypatch):
     lambda: ToolProvider("example", "1", (ToolDeclaration(example_tool, "1", "read_only", None),)),
 ])
 def test_invalid_provider_fails_at_worker_start(monkeypatch, factory):
+    monkeypatch.setenv("AGENT_DATABASE_URL", "postgresql://user:secret@localhost/test")
+    monkeypatch.setenv("AGENT_MODEL_URL", "http://model.test")
+    monkeypatch.setenv("AGENT_MODEL", "test-model")
     monkeypatch.setenv("AGENT_TOOL_PROVIDERS", _provider_module(monkeypatch, factory))
     with pytest.raises(RuntimeError):
         worker_main()

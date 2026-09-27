@@ -40,6 +40,11 @@ def test_timeout_configuration_rejects_invalid_values(monkeypatch, name, bad):
 
 
 def test_worker_rejects_invalid_timeout_before_starting(monkeypatch):
+    monkeypatch.setenv("AGENT_DATABASE_URL", "postgresql://user:secret@localhost/test")
+    monkeypatch.setenv("AGENT_MODEL_URL", "http://model.test")
+    monkeypatch.setenv("AGENT_MODEL", "test-model")
+    monkeypatch.setenv("RAG_BASE_URL", "http://rag.test")
+    monkeypatch.setenv("RAG_SERVICE_TOKEN", "s" * 43)
     monkeypatch.setenv("AGENT_MODEL_TIMEOUT_SECONDS", "nan")
     with pytest.raises(ValueError, match="AGENT_MODEL_TIMEOUT_SECONDS"):
         worker.main()

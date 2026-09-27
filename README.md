@@ -38,6 +38,11 @@ python3.12 -m venv .venv
 | `AGENT_MAX_CONCURRENT_RUNS` | 所有父 Worker 共用的数据库全局并发上限，默认 2 |
 | `AGENT_LEASE_SECONDS` / `AGENT_HEARTBEAT_SECONDS` | 执行租约与父 Worker 心跳周期，默认 120/30 秒 |
 | `AGENT_TOOL_PROVIDERS` | Worker 启用的服务端工具提供者，逗号分隔的 `module:factory`；默认只加载 RAG 证据工具 |
+| `DB_CONNECT_TIMEOUT_SECONDS` | 运行时数据库连接上限，默认 10 秒 |
+| `DB_STATEMENT_TIMEOUT_SECONDS` / `DB_LOCK_TIMEOUT_SECONDS` | 普通数据库语句与锁等待上限，默认 120/30 秒 |
+| `DB_CONTROL_STATEMENT_TIMEOUT_SECONDS` / `DB_CONTROL_LOCK_TIMEOUT_SECONDS` | Worker 领取、控制、续租与失败记录上限，默认 15/5 秒 |
+| `DB_BULK_STATEMENT_TIMEOUT_SECONDS` / `DB_BULK_LOCK_TIMEOUT_SECONDS` | 文档批量发布上限，默认 3600/60 秒；总任务期限仍独立生效 |
+| `RAG_DOCUMENT_TIMEOUT_SECONDS` | 文档首次领取后的跨尝试总期限，默认 14400 秒（4 小时）；超时直接失败 |
 
 DSN 例：`postgresql://role:password@127.0.0.1:5432/research_agent`。各运行角色需不同密码，且不能使用 owner DSN。把秘密放在进程环境或受控秘密管理系统中，不提交 `.env`。生成服务秘密可用：
 
@@ -70,6 +75,8 @@ docker run -d --name research-agent-test-pg -e POSTGRES_PASSWORD=change-me -e PO
 .venv/bin/python -m db.doctor
 .venv/bin/python -m db.doctor --json
 ```
+
+启动前可分别运行 `.venv/bin/python -m db.config_check --role agent-api`、`agent-worker`、`rag-api`、`rag-worker`。检查只解析本地配置，不连接数据库或模型；各进程启动时也会执行相同检查。配置错误只报告变量名与约束，不输出密钥。文档总期限是当前缺少真实数据集时的宽松防卡死值，后续用代表性资料校准。
 
 首次生成管理凭据：
 
@@ -177,7 +184,7 @@ curl http://127.0.0.1:8002/v1/admin/runs/RUN_UUID/timeline -H "Authorization: Be
 .venv/bin/python -m db.trace_run RUN_UUID --include-candidates
 ```
 
-`db.trace_run` 分别使用 `AGENT_DATABASE_URL` 和 `RAG_DATABASE_URL` 的只读事务，输出 v2 JSON：Agent 时间线 ID、claim → 证据 ID → 所有记录该证据的工具调用 → RAG 审计 ID，以及查询哈希、索引 revision、降级信息和检索阶段状态及候选数量。关联标为 `matched`、`fields_missing`、`conflict` 或“未观测到关联记录”；冲突记录仍显示，但不视为已核实。默认输出省略候选详情；`--include-candidates` 展示 Dense 前 50、FTS 前 50、完整融合候选及精排前 40 的 ID、名次和分数。旧审计行和读取证据审计显示“未记录候选过程”。命令不输出 task、答案、claim 文本、prompt、查询或证据正文；数据库不可用时以非零状态退出，不输出追踪 JSON。运行角色的权限限制仍适用。部署时先应用 `rag_0004` 可空字段迁移，再部署 RAG 服务，最后部署新版追踪命令。
+`db.trace_run` 分别使用 `AGENT_DATABASE_URL` 和 `RAG_DATABASE_URL` 的只读事务，输出 v2 JSON：Agent 时间线 ID、claim → 证据 ID → 所有记录该证据的工具调用 → RAG 审计 ID，以及查询哈希、索引 revision、降级信息和检索阶段状态及候选数量。关联标为 `matched`、`fields_missing`、`conflict` 或“未观测到关联记录”；冲突记录仍显示，但不视为已核实。默认输出省略候选详情；`--include-candidates` 展示 Dense 前 50、FTS 前 50、完整融合候选及精排前 40 的 ID、名次和分数。旧审计行和读取证据审计显示“未记录候选过程”。命令不输出 task、答案、claim 文本、prompt、查询或证据正文；数据库不可用时以非零状态退出，不输出追踪 JSON。运行角色的权限限制仍适用。部署时先应用当前 RAG 迁移链，再部署 RAG 服务和新版追踪命令。
 
 ```sh
 .venv/bin/python -m agent_service.worker
@@ -205,10 +212,10 @@ curl http://127.0.0.1:8001/health/ready
 curl http://127.0.0.1:8002/health/ready
 ```
 
-`/health` 只表示 API 进程存活，保持原有响应。`/health/ready` 是轻量就绪检查：数据库连接、必要表及身份表可读时，Agent 返回 `{"service":"agent","status":"ok"}`；RAG 还要求服务 token 已配置且 active index 指针有效。不可用时返回 503，`status` 为 `unavailable`，不输出连接信息或异常详情。探测有短连接和查询超时，不调用模型或完整 `db.doctor`，也不检查 Worker 在线情况。
+`/health` 只表示 API 进程存活，保持原有响应。`/health/ready` 是轻量就绪检查：数据库连接、必要表及身份表可读时，Agent 返回 `{"service":"agent","status":"ok"}`；RAG 还要求服务 token 已配置且 active index 指针有效。不可用时返回 503，`status` 为 `unavailable`，不输出连接信息或异常详情。探测有短连接和查询超时，不调用模型或完整 `db.doctor`，也不检查 Worker 在线情况。两个服务各自的管理员接口 `GET /v1/admin/workers` 返回父 Worker 最近心跳、在线实例数、待处理任务与过期租约；最近 90 秒有心跳视为在线。生产监控应对在线实例数为零、队列过期和租约过期告警；心跳不能证明外部模型可用。`db.doctor` 在有积压却无在线 Worker 或发现过期任务时给出 WARN。
 
 使用专用测试数据库及上述四个 DSN 执行 `.venv/bin/pytest -q`。测试在数据库中创建随机命名团队、凭据、Run 和合成文档；请勿指向生产库。无数据库变量时数据库测试会跳过。Agent 的 RAG 适配器只通过 HTTP/JSON 契约交互，从持久 Run 读取可信团队 ID。React、Plan-and-Execute、checkpoint、预算和结果发布使用脚本化模型验证；真实模型端点以及真实 Embedding、改写和精排服务的效果尚未验证。数据流见 [架构图](docs/architecture.md)。
 
-已有部署升级时先运行 `python -m db.migrate`：身份链新增用户与用户 Key，Agent 链新增会话、轮次、摘要、个人事实、后台任务和 Run 记忆快照。随后必须运行 `python -m db.bootstrap`，为运行角色授予新表权限及 Agent 对 pgvector 类型的解析权限。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。确认 `python -m db.doctor` 无 ERROR 后部署新 Worker；旧式返回纯工具列表的提供者须先改为声明式工厂。追踪命令只使用两个现有运行角色 DSN。
+已有部署升级时先运行 `python -m db.migrate`：Agent 与 RAG 链新增 Worker 心跳表，RAG 文档任务新增持久总期限；已有非终态任务从迁移时起获得完整 4 小时，未领取任务从首次领取起算。随后运行 `python -m db.bootstrap` 授权新表，并按角色运行配置检查。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。确认 `python -m db.doctor` 无 ERROR 后部署 API 和新 Worker，并检查管理员 Worker 状态接口。追踪命令仍只使用两个运行角色 DSN。
 
 可复现的本地 HTTP Mock 全链路步骤见 [合成资料演示](docs/synthetic-demo.md)。该流程已覆盖受限资料上传、Worker 索引、混合检索、两种 Agent 模式、工具调用和引用快照；Mock 固定输出只用于工程验收，不代表真实检索或模型效果。

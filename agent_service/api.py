@@ -3,7 +3,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Response
 
-from contracts.v1 import AdminRunList, RunAccepted, RunCreate, RunList, RunQueueSummary, RunResponse, RunStatus, RunTimeline
+from contracts.v1 import AdminRunList, RunAccepted, RunCreate, RunList, RunQueueSummary, RunResponse, RunStatus, RunTimeline, WorkerSnapshot
+from db.worker_status import snapshot
 from identity.security import Principal, agent_admin, agent_team
 from agent_service.operations import list_runs, run_queue_summary
 from agent_service.runs import cancel_run, create_run, get_run, timeline, trace
@@ -11,6 +12,12 @@ from agent_service.runs import cancel_run, create_run, get_run, timeline, trace
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
 admin_router = APIRouter(prefix="/v1/admin/runs", tags=["run trace"])
+worker_router = APIRouter(prefix="/v1/admin/workers", tags=["workers"])
+
+
+@worker_router.get("", response_model=WorkerSnapshot, dependencies=[Depends(agent_admin)])
+def worker_status():
+    return snapshot("agent")
 
 
 @router.get("", response_model=RunList)

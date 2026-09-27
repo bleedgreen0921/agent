@@ -8,6 +8,7 @@ import time
 from uuid import UUID, uuid4
 
 import httpx
+import psycopg
 from psycopg.types.json import Jsonb
 from pydantic import Field
 
@@ -313,8 +314,16 @@ def process_next_job() -> bool:
 
 
 def main():
+    backoff = 1.0
     while True:
-        if not process_next_job():
+        try:
+            worked = process_next_job()
+        except (psycopg.OperationalError, psycopg.errors.QueryCanceled, psycopg.errors.LockNotAvailable):
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
+        backoff = 1.0
+        if not worked:
             time.sleep(float(os.environ.get("AGENT_MEMORY_POLL_SECONDS", "1")))
 
 

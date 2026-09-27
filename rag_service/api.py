@@ -4,7 +4,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, Header, UploadFile
 
 from contracts.errors import ApiError
-from contracts.v1 import DocumentAccess, DocumentDeleted, DocumentVersionRef, DocumentVersionStatus, ErrorCode, Evidence, EvidenceSearchRequest, EvidenceSearchResponse, StrictModel
+from contracts.v1 import DocumentAccess, DocumentDeleted, DocumentVersionRef, DocumentVersionStatus, ErrorCode, Evidence, EvidenceSearchRequest, EvidenceSearchResponse, StrictModel, WorkerSnapshot
+from db.worker_status import snapshot
 from identity.security import Principal, admin
 from rag_service.documents import add_version, create_document, set_access, soft_delete, version_status
 from rag_service.retrieval import read_evidence, search
@@ -12,7 +13,13 @@ from rag_service.service_auth import require_service
 
 
 admin_router = APIRouter(prefix="/v1/admin/documents", tags=["documents"], dependencies=[Depends(admin)])
+worker_router = APIRouter(prefix="/v1/admin/workers", tags=["workers"], dependencies=[Depends(admin)])
 evidence_router = APIRouter(prefix="/v1/evidence", tags=["evidence"], dependencies=[Depends(require_service)])
+
+
+@worker_router.get("", response_model=WorkerSnapshot)
+def worker_status():
+    return snapshot("rag")
 
 
 def parse_team_ids(raw: str) -> list[UUID]:

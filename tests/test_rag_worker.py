@@ -19,13 +19,16 @@ def test_polling_database_failures_back_off_and_recover(monkeypatch):
     ))
     sleeps = []
 
-    def run_once():
+    def run_once(_presence):
         result = next(outcomes)
         if isinstance(result, Exception):
             raise result
         return result
 
     monkeypatch.setattr(worker, "run_once", run_once)
+    monkeypatch.setattr(worker, "validate_role", lambda _role: None)
+    monkeypatch.setattr(worker.Presence, "touch", lambda _self: None)
+    monkeypatch.setattr(worker, "remove", lambda *_args: None)
     monkeypatch.setattr(worker.time, "sleep", sleeps.append)
     monkeypatch.setattr(worker, "MAX_POLL_BACKOFF_SECONDS", 3)
 
@@ -37,21 +40,20 @@ def test_polling_database_failures_back_off_and_recover(monkeypatch):
 
 def test_processing_database_failure_is_retryable(monkeypatch):
     job = {"id": "job", "version_id": "version", "token": "token", "attempts": 1}
-    recorded = []
-    monkeypatch.setattr(worker, "claim", lambda: job)
-    monkeypatch.setattr(worker, "heartbeat", lambda claimed, stop: None)
+    reported = []
     monkeypatch.setattr(worker, "process", lambda claimed: (_ for _ in ()).throw(psycopg.OperationalError("database unavailable")))
-    monkeypatch.setattr(worker, "fail", lambda claimed, code, retryable: recorded.append((claimed, code, retryable)))
+    monkeypatch.setattr(worker.os, "setsid", lambda: None)
 
-    assert worker.run_once()
-    assert recorded == [(job, "DATABASE_UNAVAILABLE", True)]
+    class Outcome:
+        def put(self, value):
+            reported.append(value)
+
+    worker.child_main(job, Outcome())
+    assert reported == [("DATABASE_UNAVAILABLE", True)]
 
 
 def test_failure_recording_outage_does_not_escape_run_once(monkeypatch):
     job = {"id": "job", "version_id": "version", "token": "token", "attempts": 1}
-    monkeypatch.setattr(worker, "claim", lambda: job)
-    monkeypatch.setattr(worker, "heartbeat", lambda claimed, stop: None)
-    monkeypatch.setattr(worker, "process", lambda claimed: (_ for _ in ()).throw(psycopg.OperationalError("database unavailable")))
     monkeypatch.setattr(worker, "fail", lambda *args: (_ for _ in ()).throw(psycopg.OperationalError("database still unavailable")))
 
-    assert worker.run_once()
+    worker.fail_safely(job, "DATABASE_UNAVAILABLE", True)

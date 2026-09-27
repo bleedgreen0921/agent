@@ -90,6 +90,26 @@ class RunQueueSummary(StrictModel):
     oldest_claimable_created_at: datetime | None
 
 
+class WorkerInstanceStatus(StrictModel):
+    instance_id: UUID
+    started_at: datetime
+    heartbeat_at: datetime
+    online: bool
+    memory_child_alive: bool | None = None
+
+
+class WorkerSnapshot(StrictModel):
+    service: Literal["agent", "rag"]
+    observed_at: datetime
+    online_count: int
+    last_heartbeat_at: datetime | None
+    queued_count: int
+    oldest_queued_at: datetime | None
+    overdue_count: int
+    expired_lease_count: int
+    instances: list[WorkerInstanceStatus]
+
+
 class SourceLocator(StrictModel):
     kind: Literal["pdf", "docx", "markdown", "txt"]
     page_start: int | None = None

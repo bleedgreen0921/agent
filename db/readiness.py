@@ -12,11 +12,13 @@ AGENT_TABLES = (
     "agent.checkpoints", "agent.checkpoint_blobs", "agent.checkpoint_writes",
     "agent.conversations", "agent.conversation_turns", "agent.conversation_summaries",
     "agent.personal_facts", "agent.memory_jobs", "agent.run_memory_snapshots",
+    "agent.worker_instances",
 )
 RAG_TABLES = (
     "identity.credentials", "identity.teams", "identity.users", "rag.documents", "rag.document_access",
     "rag.document_versions", "rag.upload_keys", "rag.processing_jobs", "rag.chunks",
     "rag.index_revisions", "rag.index_state", "rag.embeddings", "rag.retrieval_audit",
+    "rag.worker_instances",
 )
 
 

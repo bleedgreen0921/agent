@@ -15,6 +15,22 @@ from rag_service import retrieval, worker
 pytestmark = pytest.mark.skipif(not os.environ.get("RAG_DATABASE_URL"), reason="isolated PostgreSQL not configured")
 
 
+def _run_inline_once() -> bool:
+    """Exercise document publication with test-local model fakes."""
+    job = worker.claim()
+    if not job:
+        return False
+    try:
+        worker.process(job)
+    except worker.ParseFailure as exc:
+        worker.fail_safely(job, str(exc), False)
+    except worker.ModelFailure as exc:
+        worker.fail_safely(job, exc.code, exc.retryable)
+    except psycopg.OperationalError:
+        worker.fail_safely(job, "DATABASE_UNAVAILABLE", True)
+    return True
+
+
 def _admin_and_teams():
     key_id, key, digest = new_key()
     teams = [uuid4(), uuid4()]
@@ -50,7 +66,7 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
         create_conflict = client.post("/v1/admin/documents", headers=create_headers, data={**create_data, "visibility": "public"}, files={"file": ("a.txt", b"alpha evidence", "text/plain")})
         assert create_conflict.status_code == 409
         assert client.get(f"/v1/admin/documents/{doc_id}/versions/{version_id}", headers=admin).json()["status"] == "pending"
-        assert worker.run_once()
+        assert _run_inline_once()
         assert client.get(f"/v1/admin/documents/{doc_id}/versions/{version_id}", headers=admin).json()["status"] == "active"
         search = client.post("/v1/evidence/search", headers=_service(teams[0]), json={"query": "alpha"})
         assert search.status_code == 200, search.text
@@ -84,12 +100,12 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
         conflict = client.post(f"/v1/admin/documents/{doc_id}/versions", headers={**admin, "Idempotency-Key": "next"}, files={"file": ("a.txt", b"other", "text/plain")})
         assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
         assert client.post("/v1/evidence/search", headers=_service(teams[0]), json={"query": "alpha"}).json()["evidences"]
-        assert worker.run_once()
+        assert _run_inline_once()
         current = client.post("/v1/evidence/search", headers=_service(teams[0]), json={"query": "alpha"}).json()
         assert current["evidences"][0]["document_version_id"] == "ver_" + second.json()["document_version_id"]
         invalid = client.post(f"/v1/admin/documents/{doc_id}/versions", headers=admin, files={"file": ("a.txt", b"\n", "text/plain")})
         assert invalid.status_code == 202
-        assert worker.run_once()
+        assert _run_inline_once()
         assert client.get(f"/v1/admin/documents/{doc_id}/versions/{invalid.json()['document_version_id']}", headers=admin).json()["error_code"] == "EMPTY_CONTENT"
         preserved = client.post("/v1/evidence/search", headers=_service(teams[0]), json={"query": "beta"}).json()
         assert preserved["evidences"][0]["document_version_id"] == "ver_" + second.json()["document_version_id"]
@@ -99,7 +115,7 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
             for attempt in range(1, 4):
                 with connect("RAG_DATABASE_URL") as conn:
                     conn.execute("UPDATE rag.processing_jobs SET available_at=now() WHERE version_id=%s", (UUID(transient.json()["document_version_id"]),))
-                assert worker.run_once()
+                assert _run_inline_once()
                 state = client.get(f"/v1/admin/documents/{doc_id}/versions/{transient.json()['document_version_id']}", headers=admin).json()
                 assert state["attempts"] == attempt
                 assert state["status"] == ("failed" if attempt == 3 else "pending")
@@ -109,7 +125,7 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
             for attempt in range(1, 4):
                 with connect("RAG_DATABASE_URL") as conn:
                     conn.execute("UPDATE rag.processing_jobs SET available_at=now() WHERE version_id=%s", (UUID(database_transient.json()["document_version_id"]),))
-                assert worker.run_once()
+                assert _run_inline_once()
                 state = client.get(f"/v1/admin/documents/{doc_id}/versions/{database_transient.json()['document_version_id']}", headers=admin).json()
                 assert state["attempts"] == attempt
                 assert state["error_code"] == "DATABASE_UNAVAILABLE"
@@ -123,7 +139,7 @@ def test_document_lifecycle_acl_and_degradation(monkeypatch, tmp_path):
         format_variant = client.post(f"/v1/admin/documents/{doc_id}/versions", headers=admin, files={"file": ("renamed.md", b"beta evidence", "text/markdown")})
         assert format_variant.status_code == 202
         assert format_variant.json()["document_version_id"] != second.json()["document_version_id"]
-        assert worker.run_once()
+        assert _run_inline_once()
         assert client.get(f"/v1/admin/documents/{doc_id}/versions/{format_variant.json()['document_version_id']}", headers=admin).json()["status"] == "active"
         assert client.get("/v1/evidence/" + evidence["evidence_id"], headers=_service(teams[0])).status_code == 200
         assert client.put(f"/v1/admin/documents/{doc_id}/access", headers=admin, json={"visibility": "restricted", "team_ids": [str(teams[1])]}).status_code == 200
