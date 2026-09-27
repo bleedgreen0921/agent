@@ -62,23 +62,56 @@ class ToolCallFailed(RuntimeError):
     pass
 
 
-def load_tools(specification: str | None = None) -> list[BaseTool]:
+@dataclass(frozen=True)
+class ToolDeclaration:
+    tool: BaseTool
+    version: str
+    kind: str
+    produces_evidence: bool
+
+
+@dataclass(frozen=True)
+class ToolProvider:
+    name: str
+    version: str
+    tools: tuple[ToolDeclaration, ...]
+
+
+def load_providers(specification: str | None = None) -> list[tuple[str, ToolProvider]]:
     configured = specification or os.environ.get("AGENT_TOOL_PROVIDERS", DEFAULT_PROVIDERS)
-    loaded: list[BaseTool] = []
+    loaded: list[tuple[str, ToolProvider]] = []
+    names: set[str] = set()
     for raw in configured.split(","):
         spec = raw.strip()
         if not spec or ":" not in spec:
             raise RuntimeError("Each AGENT_TOOL_PROVIDERS entry must be module:factory")
         module_name, factory_name = spec.rsplit(":", 1)
-        factory = getattr(importlib.import_module(module_name), factory_name)
-        provided = list(factory())
-        if not all(isinstance(item, BaseTool) for item in provided):
-            raise RuntimeError(f"Tool provider {spec} returned a non-tool value")
-        loaded.extend(provided)
-    names = [item.name for item in loaded]
-    if len(names) != len(set(names)):
-        raise RuntimeError("Configured Agent tools must have unique names")
+        provided = getattr(importlib.import_module(module_name), factory_name)()
+        if not isinstance(provided, ToolProvider) or not _nonempty(provided.name) or not _nonempty(provided.version):
+            raise RuntimeError(f"Tool provider {spec} must declare a name and version")
+        if not isinstance(provided.tools, (tuple, list)):
+            raise RuntimeError(f"Tool provider {spec} must declare its tools")
+        for declaration in provided.tools:
+            if (not isinstance(declaration, ToolDeclaration)
+                or not isinstance(declaration.tool, BaseTool)
+                or not _nonempty(declaration.version)
+                or declaration.kind not in {"read_only", "side_effect"}
+                or type(declaration.produces_evidence) is not bool):
+                raise RuntimeError(f"Tool provider {spec} has an invalid tool declaration")
+            name = declaration.tool.name
+            if not _nonempty(name) or name in names:
+                raise RuntimeError("Configured Agent tools must have unique nonempty names")
+            names.add(name)
+        loaded.append((spec, provided))
     return loaded
+
+
+def _nonempty(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def load_tools(specification: str | None = None) -> list[BaseTool]:
+    return [declaration.tool for _, provider in load_providers(specification) for declaration in provider.tools]
 
 
 def argument_summary(arguments: dict) -> dict:

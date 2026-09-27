@@ -93,7 +93,7 @@ def test_manifest_claim_is_atomic_immutable_and_least_privilege(monkeypatch):
     with connect("AGENT_DATABASE_URL") as conn:
         stored = conn.execute("SELECT schema_version,manifest FROM agent.run_manifests WHERE run_id=%s", (run_id,)).fetchone()
         conn.execute("UPDATE agent.agent_runs SET leased_until=now()-interval '1 second' WHERE id=%s", (run_id,))
-    assert stored == {"schema_version": 1, "manifest": {"marker": "first"}}
+    assert stored == {"schema_version": 2, "manifest": {"marker": "first"}}
 
     monkeypatch.setattr(runtime, "execution_manifest", lambda: {"marker": "second"})
     resumed = runtime.claim_run()
@@ -113,6 +113,18 @@ def test_manifest_claim_is_atomic_immutable_and_least_privilege(monkeypatch):
         captured = conn.execute("SELECT 1 FROM agent.run_manifests WHERE run_id=%s", (failed_run_id,)).fetchone()
     assert row == {"status": "queued", "started_at": None}
     assert captured is None
+
+    _quiesce_runs()
+    monkeypatch.setattr(runtime, "execution_manifest", manifest_module.execution_manifest)
+    _, declared_run_id = _queued_run()
+    assert runtime.claim_run()["run_id"] == declared_run_id
+    with connect("AGENT_DATABASE_URL") as conn:
+        declared = conn.execute("SELECT schema_version,manifest FROM agent.run_manifests WHERE run_id=%s", (declared_run_id,)).fetchone()
+    assert declared["schema_version"] == 2
+    assert declared["manifest"]["tools"]["providers"][0]["tools"] == [
+        {"name": "search_evidence", "version": "1", "kind": "read_only", "produces_evidence": True},
+        {"name": "read_evidence", "version": "1", "kind": "read_only", "produces_evidence": True},
+    ]
 
 
 @pytest.mark.skipif(not HAS_DATABASE, reason="isolated PostgreSQL not configured")

@@ -39,6 +39,8 @@ def terminate(child: Child) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     configured_timeouts()
+    from agent_service.tooling import load_providers
+    load_providers()
     context = mp.get_context("spawn")
     children: dict[UUID, Child] = {}
     slots = int(os.environ.get("AGENT_MAX_CONCURRENT_RUNS", "2"))

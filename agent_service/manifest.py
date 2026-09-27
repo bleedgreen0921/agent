@@ -6,7 +6,7 @@ import subprocess
 from functools import lru_cache
 from pathlib import Path
 
-from agent_service.versions import DEFAULT_TOOL_PROVIDERS, GRAPH_VERSION, MANIFEST_SCHEMA_VERSION, PROMPT_SET_VERSION
+from agent_service.versions import GRAPH_VERSION, MANIFEST_SCHEMA_VERSION, PROMPT_SET_VERSION
 from agent_service.timeouts import configured_timeouts
 
 
@@ -45,9 +45,10 @@ def application_revision() -> dict:
 
 
 def execution_manifest() -> dict:
+    from agent_service.tooling import load_providers
     timeouts = configured_timeouts()
     model_url = os.environ.get("AGENT_MODEL_URL", "")
-    providers = [item.strip() for item in os.environ.get("AGENT_TOOL_PROVIDERS", DEFAULT_TOOL_PROVIDERS).split(",") if item.strip()]
+    providers = load_providers()
     return {
         "application": application_revision(),
         "agent": {
@@ -61,7 +62,12 @@ def execution_manifest() -> dict:
             "temperature": 0,
             "max_retries": 0,
         },
-        "tools": {"providers": providers},
+        "tools": {"providers": [
+            {"factory": spec, "name": provider.name, "version": provider.version,
+             "tools": [{"name": item.tool.name, "version": item.version, "kind": item.kind,
+                        "produces_evidence": item.produces_evidence} for item in provider.tools]}
+            for spec, provider in providers
+        ]},
         "limits": {
             "model_calls": 16,
             "tool_calls": 10,

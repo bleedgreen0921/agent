@@ -6,7 +6,7 @@ import os
 from langchain.tools import ToolRuntime, tool
 
 from agent_service.rag_client import RagClient, RagError
-from agent_service.tooling import FatalToolError, ToolExecutionContext
+from agent_service.tooling import FatalToolError, ToolDeclaration, ToolExecutionContext, ToolProvider
 from contracts.v1 import ErrorCode, EvidenceSearchRequest
 
 
@@ -76,4 +76,10 @@ def read_evidence(evidence_id: str, runtime: ToolRuntime[ToolExecutionContext]) 
 
 
 def tools():
-    return [search_evidence, read_evidence]
+    return ToolProvider(
+        name="rag_evidence", version="1",
+        tools=(
+            ToolDeclaration(search_evidence, "1", "read_only", True),
+            ToolDeclaration(read_evidence, "1", "read_only", True),
+        ),
+    )

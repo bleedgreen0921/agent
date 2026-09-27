@@ -11,7 +11,7 @@ agent_service.tools.rag:tools
 ```python
 from langchain.tools import ToolRuntime, tool
 
-from agent_service.tooling import ToolExecutionContext
+from agent_service.tooling import ToolDeclaration, ToolExecutionContext, ToolProvider
 
 
 @tool
@@ -24,7 +24,10 @@ def convert_units(value: float, source: str, target: str,
 
 
 def tools():
-    return [convert_units]
+    return ToolProvider(
+        name="unit_conversion", version="1",
+        tools=(ToolDeclaration(convert_units, "1", "read_only", False),),
+    )
 ```
 
 启用多个提供者：
@@ -33,7 +36,9 @@ def tools():
 export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,my_package.agent_tools:tools'
 ```
 
-注册表要求工具名全局唯一。所有加载的工具都会自动经过同一中间件，在调用前预留 Run 工具预算、写入持久调用记录，并关联触发它的模型调用。参数 trace 只保存参数名和整体 SHA-256；通用结果 trace 只保存结果类型。提供者可以通过 `runtime.context.add_tool_metadata(...)` 增加不含敏感正文的状态、服务请求 ID 或结果摘要。
+工厂必须返回 `ToolProvider`，声明提供者名称和版本；每个 `ToolDeclaration` 必须携带 `BaseTool`、版本、`read_only` 或 `side_effect` 类型，以及是否产生可引用证据的布尔值。旧式纯工具列表不再接受。Worker 启动时验证声明与全局工具名唯一性；缺失或重复会立即报错。声明在首次认领时写入不可变的 v2 Manifest，历史 v1 Manifest 继续可读。声明只用于记录和诊断，不改变认领、checkpoint、恢复安全性或执行策略。
+
+所有加载的工具都会自动经过同一中间件，在调用前预留 Run 工具预算、写入持久调用记录，并关联触发它的模型调用。参数 trace 只保存参数名和整体 SHA-256；通用结果 trace 只保存结果类型。提供者可以通过 `runtime.context.add_tool_metadata(...)` 增加不含敏感正文的状态、服务请求 ID 或结果摘要。
 
 可处理的业务错误可以抛出 `RecoverableToolError`，中间件会把数据库 trace 和返回给 Agent 的 `ToolMessage` 都标记为错误。身份、授权和配额等必须终止 Run 的错误抛出 `FatalToolError`。其他未分类异常会把工具 trace 和 Run 都记录为 `TOOL_CALL_FAILED` 并停止本次执行，不会自动重试。未知工具或参数校验失败同样记录为失败的工具调用，但作为错误观察交回 Agent，不立即终止 Run。
 

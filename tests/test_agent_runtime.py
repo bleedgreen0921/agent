@@ -19,7 +19,7 @@ from langchain.tools import ToolRuntime, tool
 from agent_service import execution
 from agent_service.rag_client import RagError
 from agent_service.tools import rag as rag_tools
-from agent_service.tooling import RecoverableToolError, ToolExecutionContext
+from agent_service.tooling import RecoverableToolError, ToolDeclaration, ToolExecutionContext, ToolProvider
 from agent_service.app import app
 from agent_service.runs import cancel_run, get_run
 from agent_service.runtime import (
@@ -164,7 +164,10 @@ def broken_value(runtime: ToolRuntime[ToolExecutionContext]) -> str:
 
 
 def extra_tools():
-    return [echo_value, recoverable_value, broken_value]
+    return ToolProvider("test_extra", "1", tuple(
+        ToolDeclaration(item, "1", "read_only", False)
+        for item in (echo_value, recoverable_value, broken_value)
+    ))
 
 
 def configure_extra_tools(monkeypatch):

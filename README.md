@@ -139,7 +139,7 @@ curl http://127.0.0.1:8002/v1/admin/runs/summary -H "Authorization: Bearer $ADMI
 
 管理概览返回 `queued_within_deadline`、`queued_past_deadline`、`running_lease_valid`、`running_lease_expired`、`cancelling` 五项数量，以及 `oldest_claimable_created_at`（无可认领 Run 时为 `null`）。它按查询时数据库中已持久化的状态统计；读取不会结算超时、估算精确队列位置或判断 Worker 是否在线。
 
-父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。首次认领与状态变更在同一事务中写入不可变的 Execution Manifest，记录部署 revision、执行图/提示集版本、模型非秘密配置摘要、工具提供者、预算及两个调用超时值；恢复认领沿用快照，旧 Manifest 缺少超时字段时使用当前配置。两个超时配置只接受有限正数，Worker 启动时验证。Manifest 不保存模型 Key、RAG token 或完整模型 URL。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。只有已经显式确认写入 LangGraph checkpoint 的调用才允许恢复；失租时若存在结果未知或尚未确认持久化的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
+父 Worker 从 PostgreSQL 认领 Run，每个 Run 启动一个独立子进程。首次认领与状态变更在同一事务中写入不可变的 v2 Execution Manifest，记录部署 revision、执行图/提示集版本、模型非秘密配置摘要、工具提供者及逐工具声明、预算及两个调用超时值；历史 v1 Manifest 继续可读，恢复认领沿用快照，旧 Manifest 缺少超时字段时使用当前配置。两个超时配置只接受有限正数，Worker 启动时验证；工具声明也在 Worker 启动时验证。Manifest 不保存模型 Key、RAG token 或完整模型 URL。所有模型和工具调用在发出前持久预留额度；默认每个 Run 最多 16 次模型调用（保留最后一次用于最终生成）和 10 次工具调用。只有已经显式确认写入 LangGraph checkpoint 的调用才允许恢复；失租时若存在结果未知或尚未确认持久化的外部调用，Run 以 `INTERRUPTED_UNKNOWN` 失败，避免重放。内部调用 trace 只保存安全摘要；LangGraph checkpoint 可能保存原始消息，首版不自动清理。
 
 RAG 搜索可能依次等待查询改写、Embedding 和精排；RAG 服务内部这三步仍使用各自的 30 秒模型超时与降级流程。Agent 的 HTTP 网络超时按连接及读写等阶段计时，不保证严格的整次调用墙钟上限；Run 总期限继续提供最终墙钟限制。模型超时使 Run 以 `MODEL_TIMEOUT` 失败；RAG 搜索超时按不可用降级，工具 trace 记 `RAG_TIMEOUT`。超时只表示调用方未及时收到结果，不证明远端未执行，因此不会自动重试。
 
@@ -148,7 +148,10 @@ RAG 搜索可能依次等待查询改写、Embedding 和精排；RAG 服务内�
 ```sh
 curl http://127.0.0.1:8002/v1/admin/runs/RUN_UUID/trace -H "Authorization: Bearer $ADMIN_KEY"
 curl http://127.0.0.1:8002/v1/admin/runs/RUN_UUID/timeline -H "Authorization: Bearer $ADMIN_KEY"
+.venv/bin/python -m db.trace_run RUN_UUID
 ```
+
+`db.trace_run` 分别使用 `AGENT_DATABASE_URL` 和 `RAG_DATABASE_URL` 的只读事务，输出单 Run 的稳定 JSON：Agent 时间线 ID、工具调用与 RAG 审计关联、查询哈希、证据 ID、最终 claim 序号及引用。缺少下游审计或无法匹配的审计标记为“未观测到关联记录”；该标记不推断远端是否执行。命令不输出 task、答案、claim 文本、prompt、查询或证据正文；数据库不可用时以非零状态退出，不输出追踪 JSON。运行角色的权限限制仍适用。
 
 ```sh
 .venv/bin/python -m agent_service.worker
@@ -180,6 +183,6 @@ curl http://127.0.0.1:8002/health/ready
 
 使用专用测试数据库及上述四个 DSN 执行 `.venv/bin/pytest -q`。测试在数据库中创建随机命名团队、凭据、Run 和合成文档；请勿指向生产库。无数据库变量时数据库测试会跳过。Agent 的 RAG 适配器只通过 HTTP/JSON 契约交互，从持久 Run 读取可信团队 ID。React、Plan-and-Execute、checkpoint、预算和结果发布使用脚本化模型验证；真实模型端点以及真实 Embedding、改写和精排服务的效果尚未验证。数据流见 [架构图](docs/architecture.md)。
 
-已有部署升级时必须先升级数据结构，再部署新 API：运行 `python -m db.migrate`，其中 Agent 链的 `agent_0005` 迁移会建立团队与管理员列表排序索引；新环境再执行 checkpoint setup（已有 checkpoint 表无需重建）。本次调用超时无需新增表或迁移。现有数据库权限模型无需改变；若尚未完成以往版本的角色授权，再运行 `python -m db.bootstrap`。确认 `python -m db.doctor` 无 ERROR 后先部署包含新错误码的 Agent API，再部署 Agent Worker，避免旧 API 无法解析新 Run 错误码。旧代码可继续使用新 schema；`agent_0005` 的 downgrade 仅删除两个列表索引。
+已有部署升级时先运行 `python -m db.migrate`：Agent 链的 `agent_0006` 将 Manifest 的 schema 约束扩展为允许历史 v1 与新 v2 并存，无需新增业务表或改变运行角色权限。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。若尚未完成以往版本的角色授权，再运行 `python -m db.bootstrap`。确认 `python -m db.doctor` 无 ERROR 后部署新 Worker；旧式返回纯工具列表的提供者须先改为声明式工厂。追踪命令只使用两个现有运行角色 DSN。
 
 可复现的本地 HTTP Mock 全链路步骤见 [合成资料演示](docs/synthetic-demo.md)。该流程已覆盖受限资料上传、Worker 索引、混合检索、两种 Agent 模式、工具调用和引用快照；Mock 固定输出只用于工程验收，不代表真实检索或模型效果。
