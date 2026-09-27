@@ -233,4 +233,7 @@ def publish_result(run_id: UUID, token: UUID, draft: dict, evidence: dict[str, d
                 conn.execute("INSERT INTO agent.claim_evidence(claim_id,result_id,evidence_id) VALUES (%s,%s,%s)", (claim_id, result_id, evidence_id))
         conn.execute("""UPDATE agent.agent_runs SET status=%s,termination_reason=%s,finished_at=now(),
             lease_token=NULL,leased_until=NULL WHERE id=%s""", ("partial" if partial else "completed", termination_reason, run_id))
+        conn.execute("""INSERT INTO agent.memory_jobs(id,kind,turn_id)
+            SELECT %s,'summary',id FROM agent.conversation_turns WHERE run_id=%s
+            ON CONFLICT (kind,turn_id) DO NOTHING""", (uuid4(), run_id))
     return True

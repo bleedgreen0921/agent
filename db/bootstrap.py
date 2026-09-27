@@ -27,8 +27,8 @@ def main() -> None:
             else:
                 conn.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(sql.Identifier(role), sql.Literal(password)))
         conn.execute("REVOKE ALL ON SCHEMA public FROM PUBLIC")
-        # pgvector is installed in public; only RAG needs to resolve its type/operators.
-        conn.execute("GRANT USAGE ON SCHEMA public TO rag_runtime")
+        # Both services resolve pgvector types; neither can access the other's data.
+        conn.execute("GRANT USAGE ON SCHEMA public TO rag_runtime, agent_runtime")
         for schema in ("identity", "rag", "agent"):
             conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
             conn.execute(sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(sql.Identifier(schema)))
@@ -42,11 +42,14 @@ def main() -> None:
             conn.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA {} GRANT USAGE, SELECT ON SEQUENCES TO {}").format(sql.Identifier(schema), sql.Identifier(role)))
         for role in ("rag_runtime", "agent_runtime"):
             conn.execute(sql.SQL("GRANT USAGE ON SCHEMA identity TO {}").format(sql.Identifier(role)))
-            conn.execute(sql.SQL("GRANT SELECT ON identity.teams, identity.credentials TO {}").format(sql.Identifier(role)))
+            conn.execute(sql.SQL("GRANT SELECT ON identity.teams, identity.credentials, identity.users TO {}").format(sql.Identifier(role)))
         # Execution manifests are immutable to the runtime role even though the
         # rest of the Agent schema follows the normal CRUD default privileges.
         conn.execute("REVOKE UPDATE, DELETE ON agent.run_manifests FROM agent_runtime")
         conn.execute("GRANT SELECT, INSERT ON agent.run_manifests TO agent_runtime")
+        for table in ("conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots"):
+            conn.execute(sql.SQL("REVOKE UPDATE, DELETE ON agent.{} FROM agent_runtime").format(sql.Identifier(table)))
+            conn.execute(sql.SQL("GRANT SELECT, INSERT ON agent.{} TO agent_runtime").format(sql.Identifier(table)))
         conn.execute("REVOKE ALL ON identity.alembic_version, rag.alembic_version, agent.alembic_version FROM rag_runtime, agent_runtime, identity_admin")
 
 

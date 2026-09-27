@@ -17,6 +17,7 @@ class Principal:
     key_id: str
     kind: str
     team_id: UUID | None
+    user_id: UUID | None = None
 
 
 def new_key() -> tuple[str, str, bytes]:
@@ -34,7 +35,7 @@ def verify(raw: str | None, kind: str, env_name: str) -> Principal:
     except ValueError:
         raise ApiError(401, ErrorCode.UNAUTHENTICATED, "Invalid credential") from None
     with connect(env_name) as conn:
-        row = conn.execute("""SELECT key_id, kind, team_id, digest, expires_at, revoked_at
+        row = conn.execute("""SELECT key_id, kind, team_id, user_id, digest, expires_at, revoked_at
             FROM identity.credentials WHERE key_id = %s""", (key_id,)).fetchone()
         active_team = True
         if row and row["team_id"]:
@@ -43,7 +44,7 @@ def verify(raw: str | None, kind: str, env_name: str) -> Principal:
     matches = hmac.compare_digest(hashlib.sha256(secret.encode()).digest(), expected)
     if not row or not matches or row["kind"] != kind or row["revoked_at"] is not None or not active_team or (row["expires_at"] is not None and row["expires_at"] <= datetime.now(timezone.utc)):
         raise ApiError(401, ErrorCode.UNAUTHENTICATED, "Invalid credential")
-    return Principal(row["key_id"], kind, row["team_id"])
+    return Principal(row["key_id"], kind, row["team_id"], row["user_id"])
 
 
 def rag_team(authorization: str | None = Header(default=None)) -> Principal:
@@ -52,6 +53,14 @@ def rag_team(authorization: str | None = Header(default=None)) -> Principal:
 
 def agent_team(authorization: str | None = Header(default=None)) -> Principal:
     return verify(authorization, "team", "AGENT_DATABASE_URL")
+
+
+def agent_user(authorization: str | None = Header(default=None)) -> Principal:
+    return verify(authorization, "user", "AGENT_DATABASE_URL")
+
+
+def identity_team(authorization: str | None = Header(default=None)) -> Principal:
+    return verify(authorization, "team", "IDENTITY_ADMIN_DATABASE_URL")
 
 
 def admin(authorization: str | None = Header(default=None)) -> Principal:

@@ -7,10 +7,11 @@ from pydantic import Field
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode, StrictModel
 from db.connection import connect
-from identity.security import admin, new_key
+from identity.security import Principal, admin, identity_team, new_key
 
 
 router = APIRouter(prefix="/v1/admin", tags=["identity"], dependencies=[Depends(admin)])
+team_router = APIRouter(prefix="/v1/team", tags=["team users"])
 
 
 class CreateTeam(StrictModel):
@@ -65,6 +66,47 @@ def set_expiry(key_id: str, body: SetExpiry):
 def revoke_key(key_id: str):
     with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
         row = conn.execute("UPDATE identity.credentials SET revoked_at = COALESCE(revoked_at, now()) WHERE key_id = %s AND kind = 'team' RETURNING key_id, revoked_at", (key_id,)).fetchone()
+        if not row:
+            raise ApiError(404, ErrorCode.NOT_FOUND, "Key not found")
+    return {"key_id": key_id, "revoked_at": row["revoked_at"]}
+
+
+class CreateUser(StrictModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+@team_router.post("/users", status_code=201)
+def create_user(body: CreateUser, principal: Principal = Depends(identity_team)):
+    user_id = uuid4()
+    with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
+        conn.execute("INSERT INTO identity.users(id,team_id,name) VALUES (%s,%s,%s)", (user_id, principal.team_id, body.name))
+    return {"user_id": str(user_id), "team_id": str(principal.team_id), "name": body.name}
+
+
+@team_router.get("/users")
+def list_users(principal: Principal = Depends(identity_team)):
+    with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
+        rows = conn.execute("SELECT id,name,created_at FROM identity.users WHERE team_id=%s ORDER BY created_at,id", (principal.team_id,)).fetchall()
+    return {"items": [{"user_id": str(r["id"]), "name": r["name"], "created_at": r["created_at"]} for r in rows]}
+
+
+@team_router.post("/users/{user_id}/keys", status_code=201)
+def issue_user_key(user_id: UUID, body: IssueKey, principal: Principal = Depends(identity_team)):
+    if body.expires_at is not None and body.expires_at.tzinfo is None:
+        raise ApiError(422, ErrorCode.INVALID_REQUEST, "Expiry must include timezone")
+    key_id, raw, digest = new_key()
+    with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
+        if not conn.execute("SELECT 1 FROM identity.users WHERE id=%s AND team_id=%s", (user_id, principal.team_id)).fetchone():
+            raise ApiError(404, ErrorCode.NOT_FOUND, "User not found")
+        conn.execute("INSERT INTO identity.credentials(key_id,kind,team_id,user_id,digest,expires_at) VALUES (%s,'user',%s,%s,%s,%s)", (key_id, principal.team_id, user_id, digest, body.expires_at))
+    return {"key_id": key_id, "user_id": str(user_id), "key": raw, "expires_at": body.expires_at}
+
+
+@team_router.post("/users/{user_id}/keys/{key_id}/revoke")
+def revoke_user_key(user_id: UUID, key_id: str, principal: Principal = Depends(identity_team)):
+    with connect("IDENTITY_ADMIN_DATABASE_URL") as conn:
+        row = conn.execute("""UPDATE identity.credentials SET revoked_at=COALESCE(revoked_at,now())
+            WHERE key_id=%s AND kind='user' AND user_id=%s AND team_id=%s RETURNING revoked_at""", (key_id, user_id, principal.team_id)).fetchone()
         if not row:
             raise ApiError(404, ErrorCode.NOT_FOUND, "Key not found")
     return {"key_id": key_id, "revoked_at": row["revoked_at"]}

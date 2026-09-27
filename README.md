@@ -30,6 +30,8 @@ python3.12 -m venv .venv
 | `RAG_BASE_URL` | Agent Worker 使用的 RAG API 根地址 |
 | `AGENT_MODEL_URL` / `AGENT_MODEL` / `AGENT_MODEL_KEY` | OpenAI 兼容 Chat Completions 服务根地址、模型名和 Key；根地址可含或不含 `/v1` |
 | `AGENT_MODEL_TIMEOUT_SECONDS` | Agent 模型请求超时，默认 120 秒；适用于 ReAct、规划和最终生成 |
+| `AGENT_EMBEDDING_URL` / `AGENT_EMBEDDING_MODEL` / `AGENT_EMBEDDING_KEY` | Agent 独立调用的个人记忆 Embedding 端点、模型和可选 Key；URL/Key 未设置时沿用 RAG 的端点配置，模型默认 `Qwen3-Embedding-0.6B` |
+| `AGENT_MEMORY_EMBED_TIMEOUT_SECONDS` / `AGENT_MEMORY_POLL_SECONDS` | 个人记忆 Embedding 超时及后台任务轮询间隔，默认 15/1 秒 |
 | `APP_REVISION` | 可选的部署版本标识；优先写入 Run Execution Manifest，未设置时回退到 Git HEAD，最后使用 `unknown` |
 | `AGENT_QUEUE_TIMEOUT_SECONDS` | Run 排队期限，默认 60 秒 |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | 首次认领后的总墙钟期限，默认 300 秒；模型与工具等待均计入，期限到达后父 Worker 终止子进程 |
@@ -60,7 +62,7 @@ docker run -d --name research-agent-test-pg -e POSTGRES_PASSWORD=change-me -e PO
 .venv/bin/python -m db.doctor
 ```
 
-`db.migrate` 依次运行 `identity`、`rag`、`agent` 三条独立 Alembic 链，各有自己的 `alembic_version`。RAG 链安装 `vector` 扩展。`agent_service.checkpoints` 由数据库 owner 显式建立 LangGraph 恢复表；API 和 Worker 都不会自动建表或迁移。`db.bootstrap` 创建或重置三个运行角色的密码、授权各自业务 schema，并只向 RAG/Agent 账号开放身份表的 `SELECT`；`agent_runtime` 对 Execution Manifest 只有 `SELECT`、`INSERT`，不能修改或删除。Agent 账号无 RAG schema 使用权，RAG 账号无 Agent schema 使用权。RAG 账号还需对放置 pgvector 的 `public` schema 有 `USAGE`，用于解析向量类型。数据库账号配置应在专用新数据库进行，脚本会收紧 `public` schema 权限。
+`db.migrate` 依次运行 `identity`、`rag`、`agent` 三条独立 Alembic 链，各有自己的 `alembic_version`。RAG 链安装 `vector` 扩展。`agent_service.checkpoints` 由数据库 owner 显式建立 LangGraph 恢复表；API 和 Worker 都不会自动建表或迁移。`db.bootstrap` 创建或重置三个运行角色的密码、授权各自业务 schema，并只向 RAG/Agent 账号开放身份表的 `SELECT`；`agent_runtime` 对 Manifest、轮次原文、摘要、事实和 Run 记忆快照只有 `SELECT`、`INSERT`。Agent 账号无 RAG schema 使用权，RAG 账号无 Agent schema 使用权。RAG 与 Agent 账号对放置 pgvector 的 `public` schema 仅有 `USAGE`，用于解析向量类型。数据库账号配置应在专用新数据库进行，脚本会收紧 `public` schema 权限。
 
 `db.doctor` 是严格只读的部署诊断：检查配置、四个数据库角色的连接、迁移 head、pgvector、checkpoint、权限隔离、索引 revision/Embedding 覆盖、过期租约、调用一致性和资料文件一致性。默认每项输出一行，`--json` 输出稳定的机器可读结构；只有 PASS/WARN 时退出 0，任一 ERROR 时退出 1。它不创建资料目录，也不提供自动修复：
 
@@ -85,6 +87,14 @@ curl -X POST http://127.0.0.1:8001/v1/admin/keys/KEY_ID/revoke -H "Authorization
 ```
 
 签发响应中的 `key` 是唯一一次返回的团队 Key 明文。同一团队可同时持有多把有效 Key。管理 API 应仅在内部网络提供。
+
+团队 Key 可在身份服务创建用户并签发独立用户 Key；签发明文仍只返回一次。用户 Key 只用于自己的会话和个人记忆，不能调用团队单 Run 接口。撤销用户 Key 后立即失效：
+
+```sh
+curl -X POST http://127.0.0.1:8001/v1/team/users -H "Authorization: Bearer $TEAM_KEY" -H 'Content-Type: application/json' -d '{"name":"alice"}'
+curl -X POST http://127.0.0.1:8001/v1/team/users/USER_UUID/keys -H "Authorization: Bearer $TEAM_KEY" -H 'Content-Type: application/json' -d '{}'
+curl -X POST http://127.0.0.1:8001/v1/team/users/USER_UUID/keys/KEY_ID/revoke -H "Authorization: Bearer $TEAM_KEY"
+```
 
 ## 资料处理与证据 API
 
@@ -118,6 +128,21 @@ Embedding 影子 revision 可在持续上传期间构建。`start` 创建 buildi
 ## Agent Run API 与 Worker
 
 团队 Key 可异步提交 Run。`mode` 为 `react` 或 `plan_execute`；可选 `Idempotency-Key` 在团队内防止重复提交。团队 ID、预算和工具集合都不接受客户端传入。查询 Run 会在终态结果中返回逐条 claim、实际引用的证据快照和通知。
+
+用户 Key 可创建、列出和读取自己的会话，并用必填 `Idempotency-Key` 提交轮次。每轮都是独立 Run，同一会话同时只能有一个排队、运行或取消中的 Run；同键同请求重放返回原轮次，同键不同请求为 409。跨用户读取返回 404。失败或取消的轮次仍保留用户原文，不生成助手回答。轮次读取返回原文和 Run 状态、结果；个人记忆列表是只读的。
+
+```sh
+curl -X POST http://127.0.0.1:8002/v1/conversations -H "Authorization: Bearer $USER_KEY"
+curl -X POST http://127.0.0.1:8002/v1/conversations/CONVERSATION_UUID/turns \
+  -H "Authorization: Bearer $USER_KEY" -H 'Idempotency-Key: turn-1' \
+  -H 'Content-Type: application/json' -d '{"task":"项目 A 使用 MySQL","mode":"react"}'
+curl http://127.0.0.1:8002/v1/conversations/CONVERSATION_UUID -H "Authorization: Bearer $USER_KEY"
+curl http://127.0.0.1:8002/v1/conversations/CONVERSATION_UUID/turns/TURN_UUID -H "Authorization: Bearer $USER_KEY"
+curl -X POST http://127.0.0.1:8002/v1/conversations/CONVERSATION_UUID/turns/TURN_UUID/cancel -H "Authorization: Bearer $USER_KEY"
+curl http://127.0.0.1:8002/v1/memories -H "Authorization: Bearer $USER_KEY"
+```
+
+Worker 首次执行会固定所选摘要版本、近期与未被摘要覆盖的原文轮次、相关事实 ID、顺序和降级状态；恢复时复用快照。个人事实只从用户原话提取，带来源轮次、原文片段和时间；明确对象的相关历史陈述会一起补取。没有明确变化关系的两条陈述可能并存，不应推断哪条是当前状态。个人记忆不属于 RAG 引用证据，也不是高优先级指令。Embedding 检索失败时 Run 继续使用会话上下文并在结果中给出 `MEMORY_DEGRADED` 通知。后台提取从轮次提交时排队，回答生成后另排摘要任务；失败、取消仍可提取用户原话。任务有五分钟租约和最多三次尝试，后台模型调用不占 Run 预算。完整原文作为归档；摘要和提取结果可核查，但可能出错。首版事实仅追加，不自动覆盖或删除。
 
 ```sh
 curl -X POST http://127.0.0.1:8002/v1/runs \
@@ -183,6 +208,6 @@ curl http://127.0.0.1:8002/health/ready
 
 使用专用测试数据库及上述四个 DSN 执行 `.venv/bin/pytest -q`。测试在数据库中创建随机命名团队、凭据、Run 和合成文档；请勿指向生产库。无数据库变量时数据库测试会跳过。Agent 的 RAG 适配器只通过 HTTP/JSON 契约交互，从持久 Run 读取可信团队 ID。React、Plan-and-Execute、checkpoint、预算和结果发布使用脚本化模型验证；真实模型端点以及真实 Embedding、改写和精排服务的效果尚未验证。数据流见 [架构图](docs/architecture.md)。
 
-已有部署升级时先运行 `python -m db.migrate`：Agent 链的 `agent_0006` 将 Manifest 的 schema 约束扩展为允许历史 v1 与新 v2 并存，无需新增业务表或改变运行角色权限。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。若尚未完成以往版本的角色授权，再运行 `python -m db.bootstrap`。确认 `python -m db.doctor` 无 ERROR 后部署新 Worker；旧式返回纯工具列表的提供者须先改为声明式工厂。追踪命令只使用两个现有运行角色 DSN。
+已有部署升级时先运行 `python -m db.migrate`：身份链新增用户与用户 Key，Agent 链新增会话、轮次、摘要、个人事实、后台任务和 Run 记忆快照。随后必须运行 `python -m db.bootstrap`，为运行角色授予新表权限及 Agent 对 pgvector 类型的解析权限。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。确认 `python -m db.doctor` 无 ERROR 后部署新 Worker；旧式返回纯工具列表的提供者须先改为声明式工厂。追踪命令只使用两个现有运行角色 DSN。
 
 可复现的本地 HTTP Mock 全链路步骤见 [合成资料演示](docs/synthetic-demo.md)。该流程已覆盖受限资料上传、Worker 索引、混合检索、两种 Agent 模式、工具调用和引用快照；Mock 固定输出只用于工程验收，不代表真实检索或模型效果。

@@ -147,8 +147,8 @@ def check_role_permissions() -> dict:
             if not database_access:
                 violations.append({"role": role, "object": "database", "privilege": "CONNECT", "expected": True, "actual": False})
             public_usage = conn.execute("SELECT has_schema_privilege(%s,'public','USAGE') AS allowed", (role,)).fetchone()["allowed"]
-            if public_usage != (role == "rag_runtime"):
-                violations.append({"role": role, "object": "public", "privilege": "USAGE", "expected": role == "rag_runtime", "actual": public_usage})
+            if public_usage != (role in {"rag_runtime", "agent_runtime"}):
+                violations.append({"role": role, "object": "public", "privilege": "USAGE", "expected": role in {"rag_runtime", "agent_runtime"}, "actual": public_usage})
             for schema in schemas:
                 expected_usage = schema == {"rag_runtime": "rag", "agent_runtime": "agent", "identity_admin": "identity"}[role] or (schema == "identity" and role in {"rag_runtime", "agent_runtime"})
                 actual_usage = conn.execute("SELECT has_schema_privilege(%s,%s,'USAGE') AS allowed", (role, schema)).fetchone()["allowed"]
@@ -167,10 +167,10 @@ def check_role_permissions() -> dict:
                 elif role == "rag_runtime" and schema == "rag":
                     expected = set(privileges)
                 elif role == "agent_runtime" and schema == "agent":
-                    expected = {"SELECT", "INSERT"} if name == "run_manifests" else set(privileges)
+                    expected = {"SELECT", "INSERT"} if name in {"run_manifests", "conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots"} else set(privileges)
                 elif role == "identity_admin" and schema == "identity":
                     expected = set(privileges)
-                elif role in {"rag_runtime", "agent_runtime"} and schema == "identity" and name in {"teams", "credentials"}:
+                elif role in {"rag_runtime", "agent_runtime"} and schema == "identity" and name in {"teams", "credentials", "users"}:
                     expected = {"SELECT"}
                 else:
                     expected = set()
@@ -228,6 +228,17 @@ def check_run_leases() -> dict:
     if total:
         return result("agent.run_leases", "warn", "Agent Runs have expired active leases", {"count": total, "samples": [str(row["id"]) for row in rows]})
     return result("agent.run_leases", "pass", "No active Agent Runs have expired leases")
+
+
+def check_memory_jobs() -> dict:
+    with readonly_connection("AGENT_DATABASE_URL") as conn:
+        rows = conn.execute("""SELECT id FROM agent.memory_jobs WHERE status='running' AND (leased_until IS NULL OR leased_until<=now())
+            ORDER BY id LIMIT %s""", (SAMPLE_LIMIT,)).fetchall()
+        failed = conn.execute("SELECT count(*) AS n FROM agent.memory_jobs WHERE status='failed'").fetchone()["n"]
+    if rows or failed:
+        return result("agent.memory_jobs", "warn", "Memory jobs have expired leases or exhausted retries",
+                      {"expired_samples": [str(r["id"]) for r in rows], "failed_count": failed})
+    return result("agent.memory_jobs", "pass", "Memory jobs have no expired leases or exhausted retries")
 
 
 def check_call_consistency() -> dict:
@@ -293,6 +304,7 @@ def run_checks() -> dict:
         _safe_check("rag.embedding_coverage", check_embedding_coverage),
         _safe_check("rag.processing_leases", check_processing_leases),
         _safe_check("agent.run_leases", check_run_leases),
+        _safe_check("agent.memory_jobs", check_memory_jobs),
         _safe_check("agent.call_consistency", check_call_consistency),
         _safe_check("rag.files_consistency", check_files_consistency),
     ]

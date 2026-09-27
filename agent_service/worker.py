@@ -42,12 +42,19 @@ def main() -> None:
     from agent_service.tooling import load_providers
     load_providers()
     context = mp.get_context("spawn")
+    from agent_service.memory import main as memory_main
+    memory_process = context.Process(target=memory_main, name="agent-memory-worker", daemon=True)
+    memory_process.start()
     children: dict[UUID, Child] = {}
     slots = int(os.environ.get("AGENT_MAX_CONCURRENT_RUNS", "2"))
     heartbeat_interval = float(os.environ.get("AGENT_HEARTBEAT_SECONDS", "30"))
     poll = float(os.environ.get("AGENT_CONTROL_POLL_SECONDS", "0.5"))
     try:
         while True:
+            if not memory_process.is_alive():
+                memory_process.join(timeout=0)
+                memory_process = context.Process(target=memory_main, name="agent-memory-worker", daemon=True)
+                memory_process.start()
             now = time.monotonic()
             for run_id, child in list(children.items()):
                 state = control_state(run_id, child.token)
@@ -79,6 +86,8 @@ def main() -> None:
     finally:
         for child in children.values():
             terminate(child)
+        memory_process.terminate()
+        memory_process.join(timeout=3)
 
 
 if __name__ == "__main__":
