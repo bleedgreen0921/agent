@@ -1,6 +1,14 @@
 # Research Agent Platform
 
-本仓库是独立 Git 仓库。Agent 是任务规划、工具选择和结果生成的执行主体，支持 ReAct 和固定 Plan-and-Execute 两种模式。RAG 作为当前默认工具提供者独立处理文档与证据检索，只返回证据；服务端工具注册表可以继续接入非 RAG 工具。身份、RAG 和 Agent 数据分别位于三个 schema。
+面向个人科研工作流的可扩展 Agent 执行与证据分析平台，以自动调制识别的文献检索和实验对比为首个应用场景。当前是已完成合成数据工程验收的 MVP：Agent 负责规划、工具选择和结果组织，工具负责文档检索、条件核对和确定性计算，结论关联可追溯的文档或实验文件依据。
+
+核心支持持久 Run、ReAct 和固定 Plan-and-Execute，通过服务端 Provider 加载 RAG 与实验分析工具，并统一执行身份校验、预算、trace 和引用发布。RAG 是默认的文档证据 Provider；实验 Provider 已接入，需配置后启用。身份、RAG 和 Agent 数据分别位于三个 schema，实验分析逻辑是共享 Python 模块。
+
+主要使用者是个人研究者。现有团队与用户设计保留为底层授权和隔离机制；个人部署可创建一个团队作为科研空间。自动默认空间、科研项目管理和个人工作台尚未实现。完整定位、能力边界和后续清单见[项目能力现状](docs/platform-capability-assessment.md)。
+
+个人科研实验扩展已有一批[自动调制识别虚拟实验](examples/amc_experiments/README.md)：12 份时间 ID 命名的 YAML 配置，关联 CSV/JSON 结果和 Markdown 记录。[实验分析 Provider](docs/experiment-tools.md) 已提供六个工具，支持配置检索、详情、差异、对照选择、准确率比较和混淆统计，接入统一预算、trace 与文件来源引用；需按说明配置根目录和团队后启用。运行 `.venv/bin/python -m scripts.experiment_fixture_demo` 仍可离线登记、检索、比较并导出 Markdown/CSV，无需数据库或模型。首版工具只支持这批合成格式，指标不代表真实模型效果。
+
+2026-10-08 已核验本机 Docker 修复后全量测试：**217 项通过，0 失败、0 错误、0 跳过**，包括三个实验数据库专项；全程使用合成数据与脚本化模型，未调用真实模型。报告、版本和验证范围见[验收记录](docs/validation-status.md)。真实训练日志适配、真实论文与实验联动评估、在线 Markdown/CSV 文件生成与下载仍需补全。
 
 ## 环境
 
@@ -18,6 +26,8 @@ python3.12 -m venv .venv
 | `MIGRATION_DATABASE_URL` | 数据库 owner / 迁移账号连接；仅用于迁移、角色配置和测试 |
 | `RAG_DATABASE_URL` | `rag_runtime` 连接；RAG 运行及身份只读校验 |
 | `AGENT_DATABASE_URL` | `agent_runtime` 连接；Agent 运行及身份只读校验 |
+| `AGENT_EXPERIMENT_ROOT` | 可选实验 Provider 的绝对根目录，包含 `experiments/*/config.yaml` |
+| `AGENT_EXPERIMENT_TEAM_ID` | 服务端绑定该科研目录所属团队的 UUID；实验 Provider 启用时必填 |
 | `IDENTITY_ADMIN_DATABASE_URL` | `identity_admin` 连接；仅 RAG 内部管理 API 写身份数据 |
 | `RAG_SERVICE_TOKEN` | Agent→RAG 证据路由的独立 Bearer 秘密；至少 32 随机字节的 URL 安全编码 |
 | `RAG_FILES_DIR` | API 与文档 Worker 共享的本地持久文件目录，默认 `.data/rag`；只能部署在同一主机 |
@@ -52,7 +62,13 @@ DSN 例：`postgresql://role:password@127.0.0.1:5432/research_agent`。各运行
 
 ## 准备数据库与迁移
 
-手工启动测试 PostgreSQL（没有 Compose 文件）：
+一键创建独立测试 PostgreSQL、初始化数据库并执行全量合成测试：
+
+```sh
+.venv/bin/python -m scripts.postgres_integration --suite full
+```
+
+该入口使用 `compose.integration.yaml`，默认绑定 `127.0.0.1:55432`，结束后清理本次临时数据库。详见[数据库集成测试](docs/postgres-integration.md)。如需手工准备数据库，可按以下方式启动：
 
 ```sh
 docker run -d --name research-agent-test-pg -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=research_agent -p 127.0.0.1:5432:5432 pgvector/pgvector:pg16
@@ -67,7 +83,7 @@ docker run -d --name research-agent-test-pg -e POSTGRES_PASSWORD=change-me -e PO
 .venv/bin/python -m db.doctor
 ```
 
-`db.migrate` 依次运行 `identity`、`rag`、`agent` 三条独立 Alembic 链，各有自己的 `alembic_version`。RAG 链安装 `vector` 扩展。`agent_service.checkpoints` 由数据库 owner 显式建立 LangGraph 恢复表；API 和 Worker 都不会自动建表或迁移。`db.bootstrap` 创建或重置三个运行角色的密码、授权各自业务 schema，并只向 RAG/Agent 账号开放身份表的 `SELECT`；`agent_runtime` 对 Manifest、轮次原文、摘要、事实和 Run 记忆快照只有 `SELECT`、`INSERT`。Agent 账号无 RAG schema 使用权，RAG 账号无 Agent schema 使用权。RAG 与 Agent 账号对放置 pgvector 的 `public` schema 仅有 `USAGE`，用于解析向量类型。数据库账号配置应在专用新数据库进行，脚本会收紧 `public` schema 权限。
+`db.migrate` 依次运行 `identity`、`rag`、`agent` 三条独立 Alembic 链，各有自己的 `alembic_version`。RAG 链安装 `vector` 扩展。`agent_service.checkpoints` 由数据库 owner 显式建立 LangGraph 恢复表；API 和 Worker 都不会自动建表或迁移。`db.bootstrap` 创建或重置三个运行角色的密码、授权各自业务 schema，并只向 RAG/Agent 账号开放身份表的 `SELECT`；`agent_runtime` 对 Manifest、轮次原文、摘要、事实、Run 记忆快照和实验输入快照只有 `SELECT`、`INSERT`。Agent 账号无 RAG schema 使用权，RAG 账号无 Agent schema 使用权。RAG 与 Agent 账号对放置 pgvector 的 `public` schema 仅有 `USAGE`，用于解析向量类型。数据库账号配置应在专用新数据库进行，脚本会收紧 `public` schema 权限。
 
 `db.doctor` 是严格只读的部署诊断：检查配置、四个数据库角色的连接、迁移 head、pgvector、checkpoint、权限隔离、索引 revision/Embedding 覆盖、过期租约、调用一致性和资料文件一致性。默认每项输出一行，`--json` 输出稳定的机器可读结构；只有 PASS/WARN 时退出 0，任一 ERROR 时退出 1。它不创建资料目录，也不提供自动修复：
 
@@ -216,6 +232,8 @@ curl http://127.0.0.1:8002/health/ready
 
 使用专用测试数据库及上述四个 DSN 执行 `.venv/bin/pytest -q`。测试在数据库中创建随机命名团队、凭据、Run 和合成文档；请勿指向生产库。无数据库变量时数据库测试会跳过。Agent 的 RAG 适配器只通过 HTTP/JSON 契约交互，从持久 Run 读取可信团队 ID。React、Plan-and-Execute、checkpoint、预算和结果发布使用脚本化模型验证；真实模型端点以及真实 Embedding、改写和精排服务的效果尚未验证。数据流见 [架构图](docs/architecture.md)。
 
-已有部署升级时先运行 `python -m db.migrate`：Agent 与 RAG 链新增 Worker 心跳表，RAG 文档任务新增持久总期限；已有非终态任务从迁移时起获得完整 4 小时，未领取任务从首次领取起算。随后运行 `python -m db.bootstrap` 授权新表，并按角色运行配置检查。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。确认 `python -m db.doctor` 无 ERROR 后部署 API 和新 Worker，并检查管理员 Worker 状态接口。追踪命令仍只使用两个运行角色 DSN。
+本机 Docker 可通过 `.venv/bin/python -m scripts.postgres_integration` 自动创建独立 PostgreSQL 16/pgvector 测试实例，初始化迁移、checkpoint 和角色后运行实验数据库测试；`--suite full` 运行整个测试集。使用合成资料和脚本化模型，额外禁止真实 HTTP 调用，默认结束后清理本次容器。配置与保留数据库步骤见[数据库集成测试](docs/postgres-integration.md)。
+
+已有部署升级时先运行 `python -m db.migrate`：Agent 新增不可变实验输入快照，引用支持实验文件来源；迁移链还包含 Agent/RAG Worker 心跳表和 RAG 文档任务持久总期限。随后运行 `python -m db.bootstrap` 授权新表并收紧实验快照权限，再按角色运行配置检查。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。确认 `python -m db.doctor` 无 ERROR 后部署 API 和新 Worker，并检查管理员 Worker 状态接口。追踪命令仍只使用两个运行角色 DSN。
 
 可复现的本地 HTTP Mock 全链路步骤见 [合成资料演示](docs/synthetic-demo.md)。该流程已覆盖受限资料上传、Worker 索引、混合检索、两种 Agent 模式、工具调用和引用快照；Mock 固定输出只用于工程验收，不代表真实检索或模型效果。

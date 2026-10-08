@@ -3,7 +3,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -121,14 +121,39 @@ class SourceLocator(StrictModel):
     line_end: int | None = None
 
 
+class ExperimentSourceFile(StrictModel):
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ExperimentSourceLocator(StrictModel):
+    kind: Literal["experiment"] = "experiment"
+    project_id: str
+    experiment_ids: list[str]
+    source_files: list[ExperimentSourceFile]
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    method: str
+    method_version: str
+    synthetic: bool
+
+
 class Evidence(StrictModel):
     evidence_id: str
-    document_id: str
-    document_version_id: str
+    document_id: str | None = None
+    document_version_id: str | None = None
     title: str
     content: str
-    source_locator: SourceLocator
+    source_locator: SourceLocator | ExperimentSourceLocator = Field(discriminator="kind")
     rank: int | None = None
+
+    @model_validator(mode="after")
+    def validate_source_identity(self):
+        if isinstance(self.source_locator, SourceLocator):
+            if not self.document_id or not self.document_version_id:
+                raise ValueError("Document evidence requires document and version IDs")
+        elif self.document_id is not None or self.document_version_id is not None:
+            raise ValueError("Experiment evidence must use experiment source identity")
+        return self
 
 
 class EvidenceSearchRequest(StrictModel):

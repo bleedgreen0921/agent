@@ -4,3 +4,7 @@ __pycache__/
 .env
 .data/
 *.pyc
+
+# Locally generated synthetic experiment data; keep the usage documentation.
+/examples/amc_experiments/*
+!/examples/amc_experiments/README.md

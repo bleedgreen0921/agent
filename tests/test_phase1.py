@@ -7,6 +7,8 @@ from uuid import uuid4
 import httpx
 import psycopg
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException
@@ -173,8 +175,13 @@ def test_rag_adapter_default_client_has_bounded_timeout(monkeypatch):
 @pytest.mark.skipif(not os.environ.get("IDENTITY_ADMIN_DATABASE_URL"), reason="isolated PostgreSQL not configured")
 def test_migrations_permissions_and_key_lifecycle():
     with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
-        for schema, version in (("identity", "identity_0002"), ("rag", "rag_0005"), ("agent", "agent_0008")):
-            assert conn.execute(f"SELECT version_num FROM {schema}.alembic_version").fetchone()[0] == version
+        for schema, package in (("identity", "identity"), ("rag", "rag_service"), ("agent", "agent_service")):
+            config = Config()
+            config.set_main_option("script_location", str(migrate.ROOT / package / "migrations"))
+            expected = ScriptDirectory.from_config(config).get_current_head()
+            assert expected is not None, f"{schema} migration chain has no head"
+            actual = conn.execute(f"SELECT version_num FROM {schema}.alembic_version").fetchone()[0]
+            assert actual == expected, f"{schema}: database is at {actual}, expected migration head {expected}"
         assert conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'").fetchone()
     with connect("RAG_DATABASE_URL") as conn:
         assert conn.execute("SELECT count(*) AS n FROM identity.teams").fetchone()["n"] >= 0

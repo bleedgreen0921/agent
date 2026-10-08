@@ -19,7 +19,7 @@ from langchain.tools import ToolRuntime, tool
 from agent_service import execution
 from agent_service.rag_client import RagError
 from agent_service.tools import rag as rag_tools
-from agent_service.tooling import RecoverableToolError, ToolDeclaration, ToolExecutionContext, ToolProvider
+from agent_service.tooling import FatalToolError, RecoverableToolError, ToolDeclaration, ToolExecutionContext, ToolProvider
 from agent_service.app import app
 from agent_service.runs import cancel_run, get_run
 from agent_service.runtime import (
@@ -778,6 +778,100 @@ def test_recoverable_tool_error_has_consistent_message_and_trace_status(monkeypa
     assert call == {"status": "failed", "error_code": "TEMPORARY_TOOL_ERROR"}
     tool_messages = checkpoint_tool_messages(run_id)
     assert any(message.tool_call_id == "recoverable-1" and message.status == "error" for message in tool_messages)
+
+
+class ExperimentEvidenceModel(ScriptedModel):
+    def with_structured_output(self, schema, **kwargs):
+        if schema is not execution.FinalDraft:
+            return super().with_structured_output(schema, **kwargs)
+
+        def value(messages):
+            payload = json.loads(messages[-1][1])
+            evidence = next(item for item in payload["available_evidence"]
+                            if item["title"] == "compare_experiment_metrics")
+            return execution.FinalDraft(answer="合成实验准确率差异为 5.5 个百分点。",
+                claims=[execution.DraftClaim(text="合成实验差异为 5.5 个百分点。", support="evidence",
+                                             evidence_ids=[evidence["evidence_id"]])])
+        return RunnableLambda(value)
+
+
+@pytest.mark.parametrize("mode", ["react", "plan_execute"])
+def test_experiment_provider_publishes_file_citations_with_real_db_in_both_modes(monkeypatch, tmp_path, mode):
+    import psycopg
+    from scripts.synthetic_experiments import generate
+
+    quiesce_runs()
+    root = tmp_path / "experiment-inputs"
+    generate(root)
+    team_id, _ = credential()
+    monkeypatch.setenv("AGENT_TOOL_PROVIDERS", "agent_service.tools.experiments:tools")
+    monkeypatch.setenv("AGENT_EXPERIMENT_ROOT", str(root))
+    monkeypatch.setenv("AGENT_EXPERIMENT_TEAM_ID", str(team_id))
+    monkeypatch.setenv("AGENT_MODEL", "scripted-experiments")
+    requests = [
+        ("search_experiments", {"filters": {"model.attention.enabled": True}}),
+        ("find_experiment_controls", {"baseline_id": "20261001_090000", "changed_paths": ["model.attention.enabled"]}),
+        ("compare_experiment_metrics", {"left_id": "20261001_090000", "right_id": "20261001_103000",
+                                        "changed_paths": ["model.attention.enabled"]}),
+    ]
+    messages = [AIMessage(content="", tool_calls=[{"name": name, "args": args,
+                 "id": f"exp-call-{index}", "type": "tool_call"}]) for index, (name, args) in enumerate(requests)]
+    messages.append(AIMessage(content="Comparison complete"))
+    monkeypatch.setattr(execution, "model", lambda: ExperimentEvidenceModel(responses=messages))
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    with connect("AGENT_DATABASE_URL") as conn:
+        conn.execute("UPDATE agent.agent_runs SET mode=%s WHERE id=%s", (mode, run_id))
+    claimed = claim_run()
+    assert claimed["run_id"] == run_id
+    execution.execute_run(run_id, claimed["lease_token"])
+    response = RunResponse.model_validate(get_run(run_id, team_id))
+    assert response.status == "completed" and response.result is not None
+    citation = response.result.citations[0]
+    assert citation.source_locator.kind == "experiment" and citation.document_id is None
+    assert set(citation.source_locator.experiment_ids) == {"20261001_090000", "20261001_103000"}
+    assert json.loads(citation.content)["data"]["aggregates"]["overall"]["delta_percentage_points"] == 5.5
+    assert any(item["code"] == "EXPERIMENT_SYNTHETIC" for item in response.result.notices)
+    with connect("AGENT_DATABASE_URL") as conn:
+        assert conn.execute("SELECT count(*) AS n FROM agent.run_experiment_snapshots WHERE run_id=%s", (run_id,)).fetchone()["n"] == 1
+        run = conn.execute("SELECT tool_calls_used FROM agent.agent_runs WHERE id=%s", (run_id,)).fetchone()
+        assert run["tool_calls_used"] == 3
+        calls = conn.execute("""SELECT status,evidence_ids,triggering_model_call_id FROM agent.tool_calls
+            WHERE run_id=%s ORDER BY started_at,id""", (run_id,)).fetchall()
+        assert all(row["status"] == "succeeded" and row["evidence_ids"] and row["triggering_model_call_id"] for row in calls)
+    for statement in ("UPDATE agent.run_experiment_snapshots SET snapshot='{}'::jsonb WHERE run_id=%s",
+                      "DELETE FROM agent.run_experiment_snapshots WHERE run_id=%s"):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with connect("AGENT_DATABASE_URL") as conn:
+                conn.execute(statement, (run_id,))
+    # Published citations remain stable even if the original configuration changes.
+    (root / "experiments/20261001_090000/config.yaml").write_text("changed after publication")
+    again = RunResponse.model_validate(get_run(run_id, team_id))
+    assert again.result.citations == response.result.citations
+
+
+def test_experiment_snapshot_concurrency_and_durable_lease_checks(monkeypatch, tmp_path):
+    from agent_service.tools import experiments
+    from scripts.synthetic_experiments import generate
+
+    quiesce_runs()
+    root = tmp_path / "experiment-inputs"
+    generate(root)
+    team_id, _ = credential()
+    run_id = insert_run(team_id, created_delta=timedelta(days=-1))
+    claimed = claim_run()
+    context = ToolExecutionContext(run_id, claimed["lease_token"], team_id=team_id)
+    settings = experiments.Settings(root, team_id)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        snapshots = list(executor.map(lambda _: experiments.load_snapshot(context, settings), range(2)))
+    assert snapshots[0] == snapshots[1]
+    (root / "experiments/20261001_090000/config.yaml").write_text("changed source")
+    assert experiments.load_snapshot(context, settings) == snapshots[0]
+    wrong_lease = ToolExecutionContext(run_id, uuid4(), team_id=team_id)
+    with pytest.raises(PermissionError):
+        experiments.load_snapshot(wrong_lease, settings)
+    forged = ToolExecutionContext(run_id, claimed["lease_token"], team_id=uuid4())
+    with pytest.raises(FatalToolError):
+        experiments.load_snapshot(forged, settings)
 
 
 def test_unhandled_tool_error_has_distinct_public_run_failure(monkeypatch):

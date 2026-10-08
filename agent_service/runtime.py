@@ -224,7 +224,7 @@ def publish_result(run_id: UUID, token: UUID, draft: dict, evidence: dict[str, d
         for evidence_id in cited_ids:
             item = evidence[evidence_id]
             conn.execute("""INSERT INTO agent.evidence_snapshots(result_id,evidence_id,document_id,document_version_id,title,content,source_locator)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)""", (result_id, evidence_id, item["document_id"], item["document_version_id"], item["title"], item["content"], Jsonb(item["source_locator"])))
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""", (result_id, evidence_id, item.get("document_id"), item.get("document_version_id"), item["title"], item["content"], Jsonb(item["source_locator"])))
         for ordinal, claim in enumerate(draft["claims"], 1):
             claim_id = uuid4()
             conn.execute("""INSERT INTO agent.result_claims(id,result_id,ordinal,text,support,reason)

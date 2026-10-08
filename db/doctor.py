@@ -168,7 +168,7 @@ def check_role_permissions() -> dict:
                 elif role == "rag_runtime" and schema == "rag":
                     expected = set(privileges)
                 elif role == "agent_runtime" and schema == "agent":
-                    expected = {"SELECT", "INSERT"} if name in {"run_manifests", "conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots"} else set(privileges)
+                    expected = {"SELECT", "INSERT"} if name in {"run_manifests", "conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots", "run_experiment_snapshots"} else set(privileges)
                 elif role == "identity_admin" and schema == "identity":
                     expected = set(privileges)
                 elif role in {"rag_runtime", "agent_runtime"} and schema == "identity" and name in {"teams", "credentials", "users"}:

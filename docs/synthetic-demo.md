@@ -1,5 +1,7 @@
 # 合成资料全链路演示
 
+这是科研平台的文档 RAG HTTP 接线演示。实验配置检索、对照分析与文件依据引用已由另一类实验 Provider 接入；它们的一键真实数据库验收见[数据库集成测试](postgres-integration.md)，2026-10-08 的完整结果见[验收记录](validation-status.md)。本页流程只演示文档链路，不代表实验工具演示。
+
 本演示使用固定输出的本地 HTTP Mock 验证服务接线、数据边界和引用流转。它不衡量模型或检索质量，也不能替代真实模型与真实资料试跑。Mock 默认只监听 `127.0.0.1`。
 
 先按 README 完成空数据库迁移、checkpoint 建表和角色授权，然后在项目根目录设置四个数据库 DSN。生成演示凭据和共享配置：
@@ -18,6 +20,7 @@ export RAG_RERANK_URL=http://127.0.0.1:8090
 export AGENT_MODEL_URL=http://127.0.0.1:8090
 export AGENT_MODEL=synthetic
 export AGENT_MODEL_KEY=synthetic
+export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools'
 ```
 
 在五个终端中保留相同环境变量，分别启动模型 Mock、两个 API 和两个 Worker：
