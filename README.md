@@ -2,13 +2,40 @@
 
 面向个人科研工作流的可扩展 Agent 执行与证据分析平台，以自动调制识别的文献检索和实验对比为首个应用场景。当前是已完成合成数据工程验收的 MVP：Agent 负责规划、工具选择和结果组织，工具负责文档检索、条件核对和确定性计算，结论关联可追溯的文档或实验文件依据。
 
-核心支持持久 Run、ReAct 和固定 Plan-and-Execute，通过服务端 Provider 加载 RAG 与实验分析工具，并统一执行身份校验、预算、trace 和引用发布。RAG 是默认的文档证据 Provider；实验 Provider 已接入，需配置后启用。身份、RAG 和 Agent 数据分别位于三个 schema，实验分析逻辑是共享 Python 模块。
+核心支持持久 Run、ReAct 和固定 Plan-and-Execute，通过服务端 Provider 加载 RAG、实验分析与绘图工具，并统一执行身份校验、预算、trace 和引用发布。RAG 是默认的文档证据 Provider；实验 Provider 已接入，需配置后启用。身份、RAG 和 Agent 数据分别位于三个 schema，实验分析逻辑是共享 Python 模块。
 
 主要使用者是个人研究者。现有团队与用户设计保留为底层授权和隔离机制；个人部署可创建一个团队作为科研空间。自动默认空间、科研项目管理和个人工作台尚未实现。完整定位、能力边界和后续清单见[项目能力现状](docs/platform-capability-assessment.md)。
 
 个人科研实验扩展已有一批[自动调制识别虚拟实验](examples/amc_experiments/README.md)：12 份时间 ID 命名的 YAML 配置，关联 CSV/JSON 结果和 Markdown 记录。[实验分析 Provider](docs/experiment-tools.md) 已提供六个工具，支持配置检索、详情、差异、对照选择、准确率比较和混淆统计，接入统一预算、trace 与文件来源引用；需按说明配置根目录和团队后启用。运行 `.venv/bin/python -m scripts.experiment_fixture_demo` 仍可离线登记、检索、比较并导出 Markdown/CSV，无需数据库或模型。首版工具只支持这批合成格式，指标不代表真实模型效果。
 
-2026-10-08 已核验本机 Docker 修复后全量测试：**217 项通过，0 失败、0 错误、0 跳过**，包括三个实验数据库专项；全程使用合成数据与脚本化模型，未调用真实模型。报告、版本和验证范围见[验收记录](docs/validation-status.md)。真实训练日志适配、真实论文与实验联动评估、在线 Markdown/CSV 文件生成与下载仍需补全。
+[科研图生成](docs/experiment-plots.md)提供两个独立工具及共享实现的离线命令，输出本地 PNG/SVG、绘图数据和来源清单。`scripts.synthetic_research` 可生成方法、评测口径与矛盾记录，使用 `scripts.postgres_integration --suite research` 验证真实 PostgreSQL/RAG 与实验分析、绘图、恢复和混合引用的完整链路。
+
+2026-10-08 已核验本机 Docker 修复后全量测试：**299 项通过，0 失败、0 错误、0 跳过**，包括三个原实验数据库专项、两个绘图专项和两个资料联动专项；全程使用合成数据与脚本化模型，未调用真实模型。报告、版本和验证范围见[验收记录](docs/validation-status.md)。真实训练日志适配、真实论文与实验联动评估、在线 Markdown/CSV 文件生成与下载仍需补全。
+
+## 合成资料与绘图快速体验
+
+安装下述固定依赖后，在仓库根目录执行。离线生成资料和图片无需数据库、API 或模型：
+
+```sh
+.venv/bin/python -m scripts.synthetic_research --output .data/research/materials
+.venv/bin/python -m scripts.experiment_plot_demo \
+  --root .data/research/materials/experiment_inputs --output .data/research/plots \
+  accuracy 20261001_090000 20261001_103000
+.venv/bin/python -m scripts.experiment_plot_demo \
+  --root .data/research/materials/experiment_inputs --output .data/research/plots \
+  confusion 20261001_090000
+```
+
+每个 `plots/offline/<plot_id>/` 目录包含 PNG、SVG、绘图数据与来源清单。Agent 使用相同实现，并将产物元数据保存在当前 Run 的实验证据中。图片为本地文件，通过配置的输出根目录查看；使用说明见[科研绘图](docs/experiment-plots.md)。
+
+有 Docker 时，可直接执行真实 RAG 与实验工具的联动验收：
+
+```sh
+.venv/bin/python -m scripts.postgres_integration --suite research
+.venv/bin/python -m scripts.postgres_integration --suite full
+```
+
+科研专项已通过 68 项测试，覆盖真实上传、RAG Worker、检索 SQL、对照计算、绘图、恢复和引用发布；模型组件使用脚本化替身或 Mock，真实 HTTP 请求被阻断。完整流程见[合成资料演示与验收](docs/synthetic-demo.md)。
 
 ## 环境
 
@@ -27,6 +54,7 @@ python3.12 -m venv .venv
 | `RAG_DATABASE_URL` | `rag_runtime` 连接；RAG 运行及身份只读校验 |
 | `AGENT_DATABASE_URL` | `agent_runtime` 连接；Agent 运行及身份只读校验 |
 | `AGENT_EXPERIMENT_ROOT` | 可选实验 Provider 的绝对根目录，包含 `experiments/*/config.yaml` |
+| `AGENT_EXPERIMENT_PLOT_ROOT` | 可选绘图输出根目录，必须为绝对路径并位于实验输入目录之外；默认仓库 `.data/experiment_plots` |
 | `AGENT_EXPERIMENT_TEAM_ID` | 服务端绑定该科研目录所属团队的 UUID；实验 Provider 启用时必填 |
 | `IDENTITY_ADMIN_DATABASE_URL` | `identity_admin` 连接；仅 RAG 内部管理 API 写身份数据 |
 | `RAG_SERVICE_TOKEN` | Agent→RAG 证据路由的独立 Bearer 秘密；至少 32 随机字节的 URL 安全编码 |
@@ -232,8 +260,8 @@ curl http://127.0.0.1:8002/health/ready
 
 使用专用测试数据库及上述四个 DSN 执行 `.venv/bin/pytest -q`。测试在数据库中创建随机命名团队、凭据、Run 和合成文档；请勿指向生产库。无数据库变量时数据库测试会跳过。Agent 的 RAG 适配器只通过 HTTP/JSON 契约交互，从持久 Run 读取可信团队 ID。React、Plan-and-Execute、checkpoint、预算和结果发布使用脚本化模型验证；真实模型端点以及真实 Embedding、改写和精排服务的效果尚未验证。数据流见 [架构图](docs/architecture.md)。
 
-本机 Docker 可通过 `.venv/bin/python -m scripts.postgres_integration` 自动创建独立 PostgreSQL 16/pgvector 测试实例，初始化迁移、checkpoint 和角色后运行实验数据库测试；`--suite full` 运行整个测试集。使用合成资料和脚本化模型，额外禁止真实 HTTP 调用，默认结束后清理本次容器。配置与保留数据库步骤见[数据库集成测试](docs/postgres-integration.md)。
+本机 Docker 可通过 `.venv/bin/python -m scripts.postgres_integration` 自动创建独立 PostgreSQL 16/pgvector 测试实例，初始化迁移、checkpoint 和角色后运行三个原实验数据库场景；`--suite research` 运行绘图与资料联动专项，`--suite full` 运行整个测试集。后两者均要求七个核心数据库场景实际通过，且所有所选测试 0 失败、0 错误、0 跳过。使用合成资料和脚本化模型，额外禁止真实 HTTP 调用，默认结束后清理本次容器。配置与保留数据库步骤见[数据库集成测试](docs/postgres-integration.md)。
 
 已有部署升级时先运行 `python -m db.migrate`：Agent 新增不可变实验输入快照，引用支持实验文件来源；迁移链还包含 Agent/RAG Worker 心跳表和 RAG 文档任务持久总期限。随后运行 `python -m db.bootstrap` 授权新表并收紧实验快照权限，再按角色运行配置检查。新环境仍需执行 checkpoint setup；已有 checkpoint 表无需重建。确认 `python -m db.doctor` 无 ERROR 后部署 API 和新 Worker，并检查管理员 Worker 状态接口。追踪命令仍只使用两个运行角色 DSN。
 
-可复现的本地 HTTP Mock 全链路步骤见 [合成资料演示](docs/synthetic-demo.md)。该流程已覆盖受限资料上传、Worker 索引、混合检索、两种 Agent 模式、工具调用和引用快照；Mock 固定输出只用于工程验收，不代表真实检索或模型效果。
+合成资料生成、离线绘图、无真实 HTTP 的联动验收和独立文档 HTTP Mock 步骤见[合成资料演示](docs/synthetic-demo.md)。固定输出用于工程验收；真实模型的理解、自主工具选择和跨来源推理仍需后续单独评估。

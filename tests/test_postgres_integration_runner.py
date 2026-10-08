@@ -105,3 +105,107 @@ def test_command_timeout_saves_diagnostics_without_hanging(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match="timeout"):
         runner.run_command(["docker", "info"], env={}, log=log, timeout=1)
     assert "stalled" in log.read_text()
+
+
+@pytest.mark.parametrize("junit_failure", ["truncated", "unreadable", "disappeared", "missing", "valid"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_failed_pytest_retains_summary_and_original_error(tmp_path, monkeypatch, junit_failure, cleanup_failure):
+    calls = []
+    parse = runner.ET.parse
+
+    def read_report(path):
+        if junit_failure == "unreadable":
+            raise PermissionError("JUnit read denied")
+        if junit_failure == "disappeared":
+            raise FileNotFoundError("JUnit disappeared during read")
+        return parse(path)
+
+    def run(arguments, *, env, log=None, timeout=None):
+        calls.append(arguments)
+        output = '{"status":"ok","checks":[]}' if "db.doctor" in arguments else ""
+        if log:
+            log.write_text(output)
+        if "scripts.integration_pytest" in arguments:
+            path = Path(next(value.split("=", 1)[1] for value in arguments if value.startswith("--junitxml=")))
+            if junit_failure == "truncated":
+                path.write_text("<testsuites><testsuite><testcase")
+            elif junit_failure != "missing":
+                xml_report(path, "<failure/>")
+            raise RuntimeError("pytest exceeded the 600s timeout")
+        if arguments[-1] == "down" and cleanup_failure:
+            raise RuntimeError("Docker cleanup failed")
+        return output
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "run_command", run)
+    monkeypatch.setattr(runner.ET, "parse", read_report)
+    assert runner.main([]) == 1
+    report = json.loads(next(tmp_path.rglob("summary.json")).read_text())
+    assert report["status"] == "failed" and report["error"] == "pytest exceeded the 600s timeout"
+    assert report["container_started"] is True and report["elapsed_seconds"] >= 0
+    assert calls[-1][-1] == "down"
+    if cleanup_failure:
+        assert report["cleanup_error"] == "Docker cleanup failed" and "database_cleaned_up" not in report
+    else:
+        assert report["database_cleaned_up"] is True
+    if junit_failure in {"truncated", "unreadable", "disappeared"}:
+        assert report["junit_error"] and "tests" not in report
+    elif junit_failure == "valid":
+        assert report["tests"] == report["failures"] == 3 and "junit_error" not in report
+    else:
+        assert "tests" not in report and "junit_error" not in report
+
+
+def test_final_junit_read_failure_cannot_report_success(tmp_path, monkeypatch):
+    parse = runner.ET.parse
+    reads = 0
+
+    def read_report(path):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise OSError("JUnit no longer readable")
+        return parse(path)
+
+    def run(arguments, *, env, log=None, timeout=None):
+        output = '{"status":"ok","checks":[]}' if "db.doctor" in arguments else ""
+        if "scripts.integration_pytest" in arguments:
+            path = Path(next(value.split("=", 1)[1] for value in arguments if value.startswith("--junitxml=")))
+            xml_report(path)
+        if log:
+            log.write_text(output)
+        return output
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "run_command", run)
+    monkeypatch.setattr(runner.ET, "parse", read_report)
+    assert runner.main([]) == 1
+    report = json.loads(next(tmp_path.rglob("summary.json")).read_text())
+    assert report["status"] == "failed" and report["junit_error"] == "OSError: JUnit no longer readable"
+    assert report["error"] and report["database_cleaned_up"] is True and report["elapsed_seconds"] >= 0
+    assert report["tests"] == report["experiment_database_cases_passed"] == 3
+
+
+@pytest.mark.parametrize("outcome,missing", [("<skipped/>", False), ("<failure/>", False), ("<error/>", False), ("", True)])
+def test_research_requires_all_seven_database_scenarios(tmp_path, outcome, missing):
+    path = tmp_path / "research.xml"
+    xml_report(path)
+    body = path.read_text().replace("</testsuite></testsuites>", "")
+    names = [f"test_experiment_plots_publish_and_resume_in_both_modes[{mode}]" for mode in ("react", "plan_execute")]
+    names += [f"test_synthetic_research_real_rag_mixed_citations_and_resume[{mode}]" for mode in ("react", "plan_execute")]
+    body += "".join(f'<testcase name="{name}">{outcome}</testcase>' for name in (names[:-1] if missing else names))
+    path.write_text(body + "</testsuite></testsuites>")
+    with pytest.raises(RuntimeError, match="did not all pass"):
+        runner.validate_report(path, research=True)
+
+
+def test_research_report_counts_seven_actual_scenarios(tmp_path):
+    path = tmp_path / "research.xml"
+    xml_report(path)
+    body = path.read_text().replace("</testsuite></testsuites>", "")
+    body += "".join(f'<testcase name="{prefix}[{mode}]"/>' for prefix in (
+        "test_experiment_plots_publish_and_resume_in_both_modes", "test_synthetic_research_real_rag_mixed_citations_and_resume")
+        for mode in ("react", "plan_execute"))
+    path.write_text(body + "</testsuite></testsuites>")
+    report = runner.validate_report(path, research=True)
+    assert report["tests"] == 7 and report["plot_database_cases_passed"] == report["research_database_cases_passed"] == 2

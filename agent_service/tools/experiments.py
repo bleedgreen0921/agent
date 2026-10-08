@@ -54,12 +54,16 @@ def settings_from_env() -> Settings:
 def _authorize_run(conn, context: ToolExecutionContext, settings: Settings, *, lock=False):
     row = conn.execute("""SELECT team_id FROM agent.agent_runs
         WHERE id=%s AND lease_token=%s AND status='running'
-          AND leased_until>now() AND execution_deadline_at>now()""" + (" FOR UPDATE" if lock else ""),
+          AND leased_until>clock_timestamp() AND execution_deadline_at>clock_timestamp()""" + (" FOR UPDATE" if lock else ""),
         (context.run_id, context.lease_token)).fetchone()
     if not row:
         raise PermissionError("execution lease was revoked")
     if row["team_id"] != settings.team_id or row["team_id"] != context.team_id:
         raise FatalToolError("ACCESS_DENIED")
+    if lock:
+        # Time predicates may have been evaluated before waiting on an unchanged
+        # row. Recheck the current clock while retaining the acquired Run lock.
+        _authorize_run(conn, context, settings)
 
 
 def capture_snapshot(settings: Settings) -> dict:
@@ -130,7 +134,7 @@ def _changed_paths(paths, *, allow_empty=False):
     return set(paths)
 
 
-def _build_response(snapshot, operation, data, sources, method):
+def _build_response(snapshot, operation, data, sources, method, *, method_version=VERSION):
     """Serialize a candidate without recording evidence or tool metadata."""
     content = canonical({"operation": operation, "data": data, "synthetic": True})
     files = {item["path"]: item for entry in sources for item in entry["files"]}
@@ -138,7 +142,7 @@ def _build_response(snapshot, operation, data, sources, method):
         project_id=snapshot["project_id"], experiment_ids=[entry["experiment_id"] for entry in sources],
         source_files=[files[path] for path in sorted(files)],
         snapshot_sha256=snapshot["snapshot_sha256"], method=method,
-        method_version=VERSION, synthetic=True,
+        method_version=method_version, synthetic=True,
     )
     digest = hashlib.sha256((content + canonical(locator.model_dump())).encode()).hexdigest()
     evidence = Evidence(evidence_id="exp_" + digest, title=operation, content=content,

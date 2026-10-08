@@ -421,6 +421,25 @@ class MemoryDatabase:
         yield self
 
 
+def test_locked_authorization_rechecks_expiry_before_snapshot_insert(source, monkeypatch):
+    context = ToolExecutionContext(uuid4(), uuid4(), team_id=source.team_id)
+    database = MemoryDatabase(context)
+    execute = database.execute
+
+    def expire_after_lock(statement, parameters):
+        result = execute(statement, parameters)
+        if "FOR UPDATE" in statement:
+            database.active = False
+        return result
+
+    monkeypatch.setattr(database, "execute", expire_after_lock)
+    monkeypatch.setattr(experiments, "connect", database.connection)
+    with pytest.raises(PermissionError, match="lease was revoked"):
+        experiments.load_snapshot(context, source)
+    assert not database.snapshots
+    assert not any("INSERT INTO" in statement for statement in database.statements)
+
+
 def test_version_one_snapshot_is_rejected_without_recapture(source, monkeypatch):
     context = ToolExecutionContext(uuid4(), uuid4(), team_id=source.team_id)
     database = MemoryDatabase(context)

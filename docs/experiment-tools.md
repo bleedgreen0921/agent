@@ -20,7 +20,7 @@
 ```sh
 export AGENT_EXPERIMENT_ROOT='/home/qjj/RAG-Agent/research-agent-platform/examples/amc_experiments'
 export AGENT_EXPERIMENT_TEAM_ID='替换为已创建团队的 UUID'
-export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,agent_service.tools.experiments:tools'
+export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,agent_service.tools.experiments:tools,agent_service.tools.experiment_plots:tools'
 .venv/bin/python -m db.config_check --role agent-worker
 .venv/bin/python -m db.doctor --json
 .venv/bin/python -m agent_service.worker
@@ -67,7 +67,7 @@ export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,agent_service.tools.e
 
 运行角色对实验快照仅有 `SELECT/INSERT`。升级必须执行 `db.bootstrap` 更新权限；readiness 和 doctor 也检查新表。迁移允许文档 ID 为空，以保存非文档引用；旧 PDF / Markdown 文档证据仍要求文档与版本 ID。如果已有实验引用，降级迁移会拒绝恢复旧的非空约束，避免静默删除引用。
 
-所有工具声明为 `read_only` 且产生证据，走现有统一预算、trace 与 checkpoint。`source_locator.kind="experiment"` 的引用包含项目 ID、实验 ID、源文件相对路径和哈希、快照哈希、计算方法及版本、`synthetic` 标志；不伪造文档 ID。最终 claim 引用实际获得的 evidence ID，发布后保存被引用的结果快照。trace 仅保存操作、数量、快照哈希和 evidence ID；完整配置及结果可能保存在 checkpoint / 实验快照 / 引用内容中。
+这六个分析工具声明为 `read_only` 且产生证据，走现有统一预算、trace 与 checkpoint。`source_locator.kind="experiment"` 的引用包含项目 ID、实验 ID、源文件相对路径和哈希、快照哈希、计算方法及版本、`synthetic` 标志；不伪造文档 ID。最终 claim 引用实际获得的 evidence ID，发布后保存被引用的结果快照。trace 仅保存操作、数量、快照哈希和 evidence ID；完整配置及结果可能保存在 checkpoint / 实验快照 / 引用内容中。
 
 检索引用的实验 ID 与文件清单只覆盖实际返回的当前页；对照查找覆盖基线与当前页对照，去除重复实验。筛选与 `total` 基于整个不可变快照，`snapshot_sha256` 仍标识完整快照。检索无命中或超出末页时，实验及文件列表为空，但仍返回快照级查询证据；对照查找的空页保留基线来源。缩页试算不会写入 evidence、notice 或调用 metadata，只有通过大小检查的最终响应会记录。
 
@@ -91,6 +91,6 @@ export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,agent_service.tools.e
 
 单元测试使用真实 LangChain / LangGraph 和脚本化模型验证工具调用链、预算钩子、错误结算、checkpoint 证据恢复与最终引用，数据库连接用内存替身。数据库集成测试使用真实 PostgreSQL，覆盖两个执行模式的实际持久发布、快照并发、租约校验和运行角色不可变权限。
 
-2026-10-08 本机 Docker 修复后全量验收已完成：217 项通过、0 失败、0 错误、0 跳过，其中三个实验数据库专项全部通过；实验单元专项为 71 项通过。使用合成数据与脚本化模型，禁止真实 HTTP transport。直接运行 pytest 且未配置 DSN 时仍会跳过数据库用例；一键 Docker 入口要求专项实际通过。详细版本和报告见[验收记录](validation-status.md)。真实模型的自然语言工具选择能力仍需另行验证。
+2026-10-08 本机 Docker 修复后全量验收已完成：299 项通过、0 失败、0 错误、0 跳过，七个核心数据库场景全部通过；实验单元专项为 72 项通过。使用合成数据与脚本化模型，禁止真实 HTTP transport。直接运行 pytest 且未配置 DSN 时仍会跳过数据库用例；一键 Docker 入口要求专项实际通过。详细版本和报告见[验收记录](validation-status.md)。真实模型的自然语言工具选择能力仍需另行验证。
 
-现阶段登记是每 Run 固定的文件目录快照，还没有独立实验 CRUD API、跨 Run 常驻实验库或前端。工具结果通过现有 Run JSON 返回。Markdown/CSV 文件仍由离线 `scripts.experiment_fixture_demo` 导出；在线文件生成、下载及文件产物引用可在后续独立 Artifact 工具中接入。
+现阶段登记是每 Run 固定的文件目录快照，还没有独立实验 CRUD API、跨 Run 常驻实验库或前端。工具结果通过现有 Run JSON 返回。Markdown/CSV 文件仍由离线 `scripts.experiment_fixture_demo` 导出。独立绘图 Provider 已支持准确率–SNR 曲线和混淆矩阵的本地 PNG/SVG、数据及来源清单，并沿用实验证据与恢复机制；启用、离线命令与联动测试见[科研图生成](experiment-plots.md)。在线报告导出和文件下载 API 仍未实现。

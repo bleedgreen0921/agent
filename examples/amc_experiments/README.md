@@ -2,7 +2,7 @@
 
 本目录包含 12 个按时间 ID 命名的虚拟实验，供实验登记、配置检索、结果比较和文件导出演示使用。所有配置、曲线和指标都是合成材料，未训练模型、未使用真实射频样本，也不代表 RadioML 或任何真实数据集的效果。
 
-已可通过[实验分析 Provider](../../docs/experiment-tools.md) 接入 Agent 的六个实验工具，按说明配置根目录和团队即可启用。离线演示与 Provider 复用同一套登记、比较和计数核对逻辑；在线调用额外保存每 Run 不可变输入快照与文件引用。
+已可通过[实验分析 Provider](../../docs/experiment-tools.md) 接入 Agent 的六个分析工具，以及[科研绘图 Provider](../../docs/experiment-plots.md) 的两个绘图工具，按说明配置根目录和团队即可启用。离线演示与 Provider 复用登记、比较、计数核对及绘图实现；在线调用额外保存每 Run 不可变输入快照与文件引用。
 
 ## 文件组织
 
@@ -21,7 +21,7 @@ amc_experiments/
         └── confusion_matrices.json
 ```
 
-失败实验只有配置、研究记录、部分训练曲线和 `failure.json`，不伪造测试结果。图片与论文不属于这批数据的生成范围。
+失败实验只有配置、研究记录、部分训练曲线和 `failure.json`，不伪造测试结果。原生成器输出结构化输入；图片由绘图命令从已验证计数生成到独立目录，联动 Markdown 由 `scripts.synthetic_research` 单独生成。
 
 ## 实验清单
 
@@ -92,4 +92,27 @@ experiment_id,synthetic,split,snr_db,modulation,n_total,n_correct,accuracy
 
 离线演示本身无需 PostgreSQL、API、模型或 tokenizer。它与已接入 Agent 的实验 Provider 复用同一套登记和计算逻辑；在线工具还提供每 Run 的数据库输入快照及实验文件来源引用。当前只支持本目录约定的合成格式，独立实验管理 API、跨 Run 常驻实验库和真实训练日志适配仍需补全。
 
-2026-10-08 本机 Docker 全量合成测试 199 项通过，包含两个 Agent 模式的实验数据库发布及快照并发三个专项，未调用真实模型。详情见[验收记录](../../docs/validation-status.md)。
+## 科研图与资料联动
+
+生成本目录的实验后，可直接离线绘图，无需数据库、API 或模型：
+
+```sh
+.venv/bin/python -m scripts.experiment_plot_demo \
+  --output .data/amc_plots accuracy 20261001_090000 20261001_103000
+.venv/bin/python -m scripts.experiment_plot_demo \
+  --output .data/amc_plots confusion 20261001_090000
+.venv/bin/python -m scripts.experiment_plot_demo \
+  --output .data/amc_plots confusion 20261001_090000 --normalization row
+```
+
+每个 `offline/<plot_id>/` 目录包含 `plot.png`、`plot.svg`、`data.json`、`manifest.json`。曲线支持 1–5 个完整实验同图，要求数据集、评测配置及 SNR×类别样本数一致，其他配置差异完整披露；混淆矩阵先聚合原始计数再按行归一化。多 seed 同图不表示 seed 汇总，单对差异只支持描述性结论。
+
+独立联动资料生成器复用相同的 12 个实验，并生成注意力假设、评测口径和矛盾研究记录。任务与预期答案位于文档目录之外，不进入检索或计算：
+
+```sh
+.venv/bin/python -m scripts.synthetic_research --output .data/research/materials
+.venv/bin/python -m scripts.postgres_integration --suite research
+.venv/bin/python -m scripts.postgres_integration --suite full
+```
+
+2026-10-08 本机 Docker 科研专项 58 项、全量 277 项通过，均为 0 失败、0 错误、0 跳过；原实验三个、绘图两个、联动两个核心数据库场景均实际执行。使用真实 PostgreSQL、文档上传与 RAG 流程，模型组件全部为脚本化替身或 Mock，验证混合引用与 checkpoint 恢复，未调用真实模型。详情和图片样例见[验收记录](../../docs/validation-status.md)。

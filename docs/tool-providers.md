@@ -1,11 +1,12 @@
 # Agent 工具扩展接口
 
-Provider 是科研平台承载通用工具扩展的接口。当前已接入文档 RAG 和实验分析两类内置 Provider，共八个工具；统一预算、可信身份、trace 和证据发布复用于两类工具。当前注册配置作用于部署/Worker，尚未提供按科研项目选择工具的策略层。
+Provider 是科研平台承载通用工具扩展的接口。当前已接入文档 RAG、实验分析和科研图生成三个内置 Provider，共十个工具；统一预算、可信身份、trace 和证据发布复用于这些工具。当前注册配置作用于部署/Worker，尚未提供按科研项目选择工具的策略层。
 
 | Provider | 工厂 | 工具 | 默认启用 |
 | --- | --- | --- | --- |
 | `rag_evidence`，版本 `1` | `agent_service.tools.rag:tools` | `search_evidence`、`read_evidence` | 是 |
-| `experiment_analysis`，版本 `1` | `agent_service.tools.experiments:tools` | 配置检索、详情、差异、对照、指标比较、混淆统计，共六个 | 否；需配置实验根目录与团队 |
+| `experiment_analysis`，版本 `2` | `agent_service.tools.experiments:tools` | 配置检索、详情、差异、对照、指标比较、混淆统计，共六个 | 否；需配置实验根目录与团队 |
+| `experiment_plots`，版本 `1` | `agent_service.tools.experiment_plots:tools` | 准确率–SNR 曲线、混淆矩阵，共两个副作用证据工具 | 否；需配置实验根目录与团队，可选绘图输出根目录 |
 
 Agent 核心执行器不直接依赖 RAG 客户端。部署通过 `AGENT_TOOL_PROVIDERS` 加载工具提供者，每项使用 `python.module:factory` 格式，多个提供者用逗号分隔。默认值是：
 
@@ -40,10 +41,10 @@ def tools():
 启用多个提供者：
 
 ```sh
-export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,agent_service.tools.experiments:tools'
+export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,agent_service.tools.experiments:tools,agent_service.tools.experiment_plots:tools'
 ```
 
-实验 Provider 还要求 `AGENT_EXPERIMENT_ROOT` 和 `AGENT_EXPERIMENT_TEAM_ID`，具体见[实验工具启用说明](experiment-tools.md)。自定义 Python Provider 使用同一 `module:factory` 约定。
+实验分析和绘图 Provider 都要求 `AGENT_EXPERIMENT_ROOT` 和 `AGENT_EXPERIMENT_TEAM_ID`，具体见[实验工具启用说明](experiment-tools.md)。绘图输出根目录由可选的 `AGENT_EXPERIMENT_PLOT_ROOT` 控制，默认仓库 `.data/experiment_plots`，须位于实验输入根目录之外，详见[绘图说明](experiment-plots.md)。自定义 Python Provider 使用同一 `module:factory` 约定。
 
 工厂必须返回 `ToolProvider`，声明提供者名称和版本；每个 `ToolDeclaration` 必须携带 `BaseTool`、版本、`read_only` 或 `side_effect` 类型，以及是否产生可引用证据的布尔值。旧式纯工具列表不再接受。Worker 启动时验证声明与全局工具名唯一性；缺失或重复会立即报错。声明在首次认领时写入不可变的 v2 Manifest，历史 v1 Manifest 继续可读。声明只用于记录和诊断，不改变认领、checkpoint、恢复安全性或执行策略。
 
@@ -55,6 +56,6 @@ export AGENT_TOOL_PROVIDERS='agent_service.tools.rag:tools,agent_service.tools.e
 
 能够恢复的证据工具还应在 JSON 返回值中包含 `evidences` 数组或直接返回单个 Evidence，供 checkpoint 消息恢复引用。现有内置[实验分析 Provider](experiment-tools.md) 使用 `source_locator.kind="experiment"` 记录项目、实验、文件哈希和计算方法；PDF/Markdown 等文档来源沿用原契约，文档和版本 ID 仍为必需。实验依据不能使用虚构的文档 ID。
 
-当前声明元数据用于记录与诊断，不提供副作用工具的自动重试、幂等保证或审批节点。实验工具中的文件读取、计数核对和比较方法由程序确定，模型只选择工具和参数。在线生成 Markdown/CSV 文件的 Artifact Provider 尚待接入。
+当前声明元数据用于记录与诊断，不提供通用副作用工具的自动重试、幂等保证或审批节点。[科研绘图 Provider](experiment-plots.md) 自行实现同 Run 重复调用的文件校验与复用，损坏时拒绝覆盖。实验工具中的文件读取、计数核对和比较方法由程序确定，模型只选择工具和参数。在线生成 Markdown/CSV 文件的 Artifact Provider 尚待接入。
 
-2026-10-08 已通过两个执行模式的实验 Provider 数据库发布测试及快照并发测试，修复后完整合成测试 217 项通过。验证使用脚本化模型，真实模型的工具选择能力不在本次验收范围；详见[验收记录](validation-status.md)。
+2026-10-08 科研专项 68 项、全量合成测试 299 项通过，均为 0 失败、0 错误、0 跳过；三个原实验、两个绘图、两个资料联动核心数据库场景全部实际通过。验证使用真实 PostgreSQL/RAG 流程与脚本化模型，覆盖两个执行模式、恢复和混合引用。真实模型的工具选择能力留待后续评估；详见[验收记录](validation-status.md)。

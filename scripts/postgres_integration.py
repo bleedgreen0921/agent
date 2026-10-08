@@ -21,7 +21,7 @@ def test_environment(base: dict, port: int, files: Path) -> dict:
     """Override inherited production DSNs and model settings in child processes only."""
     env = dict(base)
     for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_MODEL_KEY", "AGENT_EXPERIMENT_ROOT",
-                 "AGENT_EXPERIMENT_TEAM_ID", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
+                 "AGENT_EXPERIMENT_TEAM_ID", "AGENT_EXPERIMENT_PLOT_ROOT", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
         env.pop(name, None)
     for variable, user in (("MIGRATION_DATABASE_URL", "postgres"), ("AGENT_DATABASE_URL", "agent_runtime"),
                            ("RAG_DATABASE_URL", "rag_runtime"), ("IDENTITY_ADMIN_DATABASE_URL", "identity_admin")):
@@ -37,19 +37,34 @@ def test_environment(base: dict, port: int, files: Path) -> dict:
     return env
 
 
-def validate_report(path: Path) -> dict:
+def validate_report(path: Path, *, research=False) -> dict:
     root = ET.parse(path).getroot()
     cases = list(root.iter("testcase"))
-    experiment_cases = [case for case in cases if case.get("name", "").startswith((
-        "test_experiment_provider_publishes_file_citations_with_real_db_in_both_modes",
-        "test_experiment_snapshot_concurrency_and_durable_lease_checks"))]
-    if len(experiment_cases) != 3 or any(any(case.find(tag) is not None for tag in
-                                           ("skipped", "failure", "error")) for case in experiment_cases):
+    experiment_names = {
+        "test_experiment_provider_publishes_file_citations_with_real_db_in_both_modes[react]",
+        "test_experiment_provider_publishes_file_citations_with_real_db_in_both_modes[plan_execute]",
+        "test_experiment_snapshot_concurrency_and_durable_lease_checks",
+    }
+    experiment_cases = [case for case in cases if case.get("name") in experiment_names]
+    if (len(experiment_cases) != 3 or {case.get("name") for case in experiment_cases} != experiment_names
+        or any(any(case.find(tag) is not None for tag in ("skipped", "failure", "error")) for case in experiment_cases)):
         raise RuntimeError("The three mandatory experiment database cases did not all pass")
+    plot_cases, linked_cases = [], []
+    if research:
+        plot_names = {f"test_experiment_plots_publish_and_resume_in_both_modes[{mode}]" for mode in ("react", "plan_execute")}
+        linked_names = {f"test_synthetic_research_real_rag_mixed_citations_and_resume[{mode}]" for mode in ("react", "plan_execute")}
+        plot_cases = [case for case in cases if case.get("name") in plot_names]
+        linked_cases = [case for case in cases if case.get("name") in linked_names]
+        if (len(plot_cases) != 2 or len(linked_cases) != 2
+            or {case.get("name") for case in plot_cases} != plot_names
+            or {case.get("name") for case in linked_cases} != linked_names
+            or any(any(case.find(tag) is not None for tag in ("skipped", "failure", "error")) for case in [*plot_cases, *linked_cases])):
+            raise RuntimeError("The four mandatory plot/research database cases did not all pass")
     return {"tests": len(cases), "failures": sum(case.find("failure") is not None for case in cases),
             "errors": sum(case.find("error") is not None for case in cases),
             "skipped": sum(case.find("skipped") is not None for case in cases),
-            "experiment_database_cases_passed": len(experiment_cases)}
+            "experiment_database_cases_passed": len(experiment_cases),
+            "plot_database_cases_passed": len(plot_cases), "research_database_cases_passed": len(linked_cases)}
 
 
 def run_command(arguments, *, env, log: Path | None = None, timeout=120):
@@ -75,7 +90,7 @@ def run_command(arguments, *, env, log: Path | None = None, timeout=120):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("experiments", "full"), default="experiments")
+    parser.add_argument("--suite", choices=("experiments", "research", "full"), default="experiments")
     parser.add_argument("--port", type=int, default=55432)
     parser.add_argument("--keep-db", action="store_true", help="retain this run's dedicated container for inspection")
     args = parser.parse_args(argv)
@@ -110,15 +125,24 @@ def main(argv=None) -> int:
             print(f"Initializing {step}...", flush=True)
             run_command([python, "-m", module] + (["--json"] if step == "doctor" else []),
                         env=env, log=output / f"{step}.log", timeout=120)
+        from experiment_service.plotting import dependencies
+        report["plot_dependencies"] = dependencies()
         report["doctor"] = json.loads((output / "doctor.log").read_text())
         print(f"Running {args.suite} suite with scripted models and real HTTP disabled...", flush=True)
-        test_args = ["tests/test_agent_runtime.py", "-k", "experiment"] if args.suite == "experiments" else []
+        if args.suite == "experiments":
+            test_args = ["tests/test_agent_runtime.py", "-k", "experiment"]
+        elif args.suite == "research":
+            test_args = ["tests/test_agent_runtime.py::test_experiment_provider_publishes_file_citations_with_real_db_in_both_modes",
+                         "tests/test_agent_runtime.py::test_experiment_snapshot_concurrency_and_durable_lease_checks",
+                         "tests/test_experiment_plots.py", "tests/test_research_integration.py", "tests/test_synthetic_research.py"]
+        else:
+            test_args = []
         junit = output / "pytest.xml"
         result = run_command([python, "-m", "scripts.integration_pytest", "-q", "-rs", "-o",
                               "faulthandler_timeout=30", f"--junitxml={junit}", *test_args],
                              env=env, log=output / "pytest.log", timeout=600)
         print(result, end="", flush=True)
-        report.update(validate_report(junit))
+        report.update(validate_report(junit, research=args.suite in {"research", "full"}))
         if report["failures"] or report["errors"] or report["skipped"]:
             raise RuntimeError("The integration suite must finish with zero failures, errors and skips")
         report["status"] = "passed"
@@ -130,6 +154,7 @@ def main(argv=None) -> int:
             print("Removing this run's dedicated container...", flush=True)
             try:
                 run_command(compose + ["down"], env=compose_env, log=output / "docker-cleanup.log", timeout=30)
+                report["database_cleaned_up"] = True
             except (OSError, RuntimeError) as exc:
                 report["cleanup_error"] = str(exc)
                 report["status"] = "failed"
@@ -142,6 +167,18 @@ def main(argv=None) -> int:
                 file.write(f"POSTGRES_INTEGRATION_PASSWORD={compose_env['POSTGRES_INTEGRATION_PASSWORD']}\n"
                            f"POSTGRES_INTEGRATION_PORT={args.port}\n")
             print(f"Retained container project: {project}; credentials: {credentials}", flush=True)
+        junit = output / "pytest.xml"
+        try:
+            if junit.exists():
+                cases = list(ET.parse(junit).getroot().iter("testcase"))
+                counts = {"tests": len(cases), "failures": sum(case.find("failure") is not None for case in cases),
+                          "errors": sum(case.find("error") is not None for case in cases),
+                          "skipped": sum(case.find("skipped") is not None for case in cases)}
+                report.update(counts)
+        except (ET.ParseError, OSError) as exc:
+            report["junit_error"] = f"{type(exc).__name__}: {exc}"
+            report.setdefault("error", f"JUnit report could not be read: {report['junit_error']}")
+            report["status"] = "failed"
         report["elapsed_seconds"] = round(time.monotonic() - began, 2)
         (output / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         print(f"Report directory: {output}", flush=True)
