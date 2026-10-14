@@ -20,7 +20,13 @@ from agent_service import execution, tooling
 from agent_service.manifest import execution_manifest
 from agent_service.runtime import BudgetExhausted
 from agent_service.tools import experiments
-from agent_service.tooling import FatalToolError, RecoverableToolError, ToolExecutionContext, load_providers
+from agent_service.tooling import RecoverableToolError, RunExecutionState, load_providers, merge_outcome
+from execution.contracts import ExecutionContext, TaskRef, TaskKind, ToolOutcome, freeze, thaw
+from execution.inputs import capture_experiment_data
+from datetime import datetime, timedelta, timezone
+
+def capture_snapshot(settings):
+    return capture_experiment_data(settings, experiments.VERSION)
 from contracts.v1 import Evidence, Result
 from experiment_service.catalogue import canonical, register
 from scripts.synthetic_experiments import generate
@@ -35,25 +41,31 @@ VARIABLE = "model.attention.enabled"
 def source(tmp_path):
     root = tmp_path / "fixture"
     generate(root)
-    return experiments.Settings(root, uuid4())
+    return experiments.Settings(root)
 
 
 @pytest.fixture
 def harness(source, monkeypatch):
-    snapshot = experiments.capture_snapshot(source)
+    snapshot = capture_snapshot(source)
     calls = []
-    monkeypatch.setattr(experiments, "load_snapshot", lambda *args: calls.append(args) or snapshot)
-    context = ToolExecutionContext(uuid4(), uuid4(), team_id=source.team_id)
-    context.tool_call_ids["test-call"] = uuid4()
+    state = RunExecutionState(uuid4(), uuid4())
+    context = ExecutionContext(TaskRef(state.run_id, TaskKind.AGENT), state.lease_token,
+                               datetime.now(timezone.utc)+timedelta(minutes=5), call_id=uuid4(),
+                               inputs=freeze({'experiment':snapshot}))
+    # Domain tests can replace their input dataset without involving a database.
+    monkeypatch.setattr(experiments, '_inputs', lambda *args: calls.append(args) or snapshot)
     runtime = ToolRuntime(state={}, context=context, config={}, stream_writer=lambda _: None,
-                          tool_call_id="test-call", store=None)
-    tools = {item.tool.name: item.tool for item in experiments.build_provider(source).tools}
-
+                          tool_call_id='test-call', store=None)
+    tools = {item.tool.name:item.tool for item in experiments._sync_provider(source).tools}
+    metadata = {}
     def invoke(name, **arguments):
-        return json.loads(tools[name].func(runtime=runtime, **arguments))
-
-    return types.SimpleNamespace(settings=source, snapshot=snapshot, context=context,
-                                 runtime=runtime, tools=tools, invoke=invoke, calls=calls)
+        content, artifact = tools[name].func(runtime=runtime, **arguments)
+        outcome = ToolOutcome.from_artifact(artifact)
+        merge_outcome(state, outcome)
+        metadata['test-call'] = thaw(outcome.metadata)
+        return json.loads(content)
+    return types.SimpleNamespace(settings=source, snapshot=snapshot, context=state, readonly=context,
+                                 runtime=runtime, tools=tools, invoke=invoke, calls=calls, metadata=metadata)
 
 
 @pytest.fixture
@@ -74,7 +86,7 @@ def large_catalogue(harness):
         path.write_text(yaml.safe_dump(config), encoding="utf-8")
         for number in range(64 - len(originals)):
             (directory / f"附加实验资料_{number:02d}.txt").write_text("small input\n", encoding="utf-8")
-    snapshot = experiments.capture_snapshot(harness.settings)
+    snapshot = capture_snapshot(harness.settings)
     assert len(snapshot["entries"]) == 40
     assert all(entry["status"] == "ready" and len(entry["files"]) == 64 for entry in snapshot["entries"])
     harness.snapshot.clear()
@@ -111,7 +123,8 @@ def test_large_catalogue_byte_pagination_visits_every_match(large_catalogue, ope
         expected.remove(BASE)
     offset, visited, pages = 0, [], []
     while True:
-        raw = harness.tools[operation].func(runtime=harness.runtime, limit=50, offset=offset, **arguments)
+        raw, artifact = harness.tools[operation].func(runtime=harness.runtime, limit=50, offset=offset, **arguments)
+        merge_outcome(harness.context, ToolOutcome.from_artifact(artifact))
         assert len(raw.encode("utf-8")) <= experiments.MAX_RESPONSE_BYTES
         result = json.loads(raw)
         data = result["data"]
@@ -158,13 +171,13 @@ def test_single_result_over_byte_budget_leaves_context_unchanged(harness, monkey
     arguments = ({"filters": {"run.experiment_id": BASE}} if operation == "search_experiments" else
                  {"baseline_id": BASE, "changed_paths": [VARIABLE]})
     existing = harness.invoke("read_experiment", experiment_id=BASE)
-    before = copy.deepcopy((harness.context.evidence, harness.context.notices, harness.context.tool_metadata))
+    before = copy.deepcopy((harness.context.evidence, harness.context.notices, harness.metadata))
     monkeypatch.setattr(experiments, "MAX_RESPONSE_BYTES", 1)
     with pytest.raises(RecoverableToolError) as error:
         harness.invoke(operation, **arguments)
     assert error.value.code == "EXPERIMENT_RESULT_TOO_LARGE"
     assert "single" in error.value.message.lower()
-    assert (harness.context.evidence, harness.context.notices, harness.context.tool_metadata) == before
+    assert (harness.context.evidence, harness.context.notices, harness.metadata) == before
     assert existing["evidences"][0]["evidence_id"] in harness.context.evidence
 
 
@@ -172,23 +185,23 @@ def test_response_budget_counts_utf8_bytes_and_accepts_exact_boundary(harness, m
     baseline = next(entry for entry in harness.snapshot["entries"] if entry["experiment_id"] == BASE)
     baseline["issues"] = ["测试字符" * 200]
     arguments = {"filters": {"run.experiment_id": BASE}, "limit": 1}
-    raw = harness.tools["search_experiments"].func(runtime=harness.runtime, **arguments)
+    raw, _artifact = harness.tools["search_experiments"].func(runtime=harness.runtime, **arguments)
     byte_count = len(raw.encode("utf-8"))
     assert byte_count > len(raw)
     monkeypatch.setattr(experiments, "MAX_RESPONSE_BYTES", byte_count)
-    assert harness.tools["search_experiments"].func(runtime=harness.runtime, **arguments) == raw
-    before = copy.deepcopy((harness.context.evidence, harness.context.notices, harness.context.tool_metadata))
+    assert harness.tools["search_experiments"].func(runtime=harness.runtime, **arguments)[0] == raw
+    before = copy.deepcopy((harness.context.evidence, harness.context.notices, harness.metadata))
     monkeypatch.setattr(experiments, "MAX_RESPONSE_BYTES", byte_count - 1)
     with pytest.raises(RecoverableToolError):
         harness.invoke("search_experiments", **arguments)
-    assert (harness.context.evidence, harness.context.notices, harness.context.tool_metadata) == before
+    assert (harness.context.evidence, harness.context.notices, harness.metadata) == before
 
 
 def test_csv_parser_error_is_retained_in_snapshot_and_status_search(harness):
     path = harness.settings.root / "experiments" / BASE / "results_by_snr.csv"
     path.write_text("experiment_id\n" + "x" * (csv.field_size_limit() + 1) + "\n", encoding="utf-8")
     assert path.stat().st_size < 2 * 1024 * 1024
-    snapshot = experiments.capture_snapshot(harness.settings)
+    snapshot = capture_snapshot(harness.settings)
     harness.snapshot.clear()
     harness.snapshot.update(snapshot)
     entry = next(entry for entry in snapshot["entries"] if entry["experiment_id"] == BASE)
@@ -203,7 +216,6 @@ def test_csv_parser_error_is_retained_in_snapshot_and_status_search(harness):
 
 def test_factory_manifest_and_model_cannot_supply_identity(source, monkeypatch):
     monkeypatch.setenv("AGENT_EXPERIMENT_ROOT", str(source.root))
-    monkeypatch.setenv("AGENT_EXPERIMENT_TEAM_ID", str(source.team_id))
     monkeypatch.setenv("AGENT_TOOL_PROVIDERS", "agent_service.tools.experiments:tools")
     provider = load_providers()[0][1]
     assert provider.name == "experiment_analysis" and len(provider.tools) == 6
@@ -216,18 +228,15 @@ def test_factory_manifest_and_model_cannot_supply_identity(source, monkeypatch):
     assert str(source.root) not in canonical(manifest)
 
 
-@pytest.mark.parametrize("invalid", ["missing_root", "relative_root", "missing_team", "invalid_team"])
+@pytest.mark.parametrize("invalid", ["missing_root", "relative_root", "invalid_root"])
 def test_invalid_configuration_fails_before_execution(source, monkeypatch, invalid):
     monkeypatch.setenv("AGENT_EXPERIMENT_ROOT", str(source.root))
-    monkeypatch.setenv("AGENT_EXPERIMENT_TEAM_ID", str(source.team_id))
     if invalid == "missing_root":
         monkeypatch.delenv("AGENT_EXPERIMENT_ROOT")
     elif invalid == "relative_root":
         monkeypatch.setenv("AGENT_EXPERIMENT_ROOT", "examples/amc_experiments")
-    elif invalid == "missing_team":
-        monkeypatch.delenv("AGENT_EXPERIMENT_TEAM_ID")
     else:
-        monkeypatch.setenv("AGENT_EXPERIMENT_TEAM_ID", "not-a-uuid")
+        monkeypatch.setenv('AGENT_EXPERIMENT_ROOT', str(source.root / 'absent'))
     with pytest.raises(RuntimeError, match="AGENT_EXPERIMENT_ROOT"):
         experiments.tools()
 
@@ -274,7 +283,7 @@ def test_read_diff_controls_and_metrics_have_verified_file_sources(harness):
     assert "sum(n_correct)/sum(n_total)" in evidence.source_locator.method
     for file in evidence.source_locator.source_files:
         assert file.sha256 == hashlib.sha256((harness.settings.root / file.path).read_bytes()).hexdigest()
-    metadata = harness.context.tool_metadata["test-call"]
+    metadata = harness.metadata["test-call"]
     assert metadata["evidence_ids"] == [evidence.evidence_id]
     assert "config" not in canonical(metadata) and "rows" not in canonical(metadata)
     assert harness.context.notices == [experiments.SYNTHETIC_NOTICE]
@@ -335,12 +344,14 @@ def test_confusions_reconcile_with_overall_errors_and_row_denominators(harness):
         harness.invoke("summarize_experiment_confusions", experiment_id=BASE, snr_db=99)
 
 
-def test_cross_team_denied_before_source_or_database_access(harness):
-    harness.context.team_id = uuid4()
-    with pytest.raises(FatalToolError) as error:
-        harness.invoke("read_experiment", experiment_id=BASE)
-    assert error.value.run_code == "ACCESS_DENIED"
-    assert not harness.calls
+def test_tool_execution_context_and_inputs_are_readonly(harness):
+    from dataclasses import FrozenInstanceError
+    with pytest.raises(FrozenInstanceError):
+        harness.readonly.lease_token = uuid4()
+    with pytest.raises(TypeError):
+        harness.readonly.inputs['experiment']['project_id'] = 'changed'
+    assert not hasattr(harness.readonly, 'evidence')
+    assert not hasattr(harness.readonly, 'notices')
 
 
 def test_unknown_id_and_path_cannot_access_arbitrary_files(harness):
@@ -361,7 +372,7 @@ def test_catalogue_rejects_symbolic_links(source, tmp_path, target):
         path.unlink()
         path.symlink_to(outside)
     with pytest.raises(RecoverableToolError) as error:
-        experiments.capture_snapshot(source)
+        capture_snapshot(source)
     assert error.value.code == "EXPERIMENT_SOURCE_INVALID"
 
 
@@ -374,7 +385,7 @@ def test_catalogue_limits_and_yaml_error_are_bounded(source):
         register(source.root, max_total_bytes=1)
     (source.root / "experiments" / BASE / "config.yaml").write_text("broken: [}")
     with pytest.raises(RecoverableToolError) as error:
-        experiments.capture_snapshot(source)
+        capture_snapshot(source)
     assert error.value.code == "EXPERIMENT_SOURCE_INVALID"
 
 
@@ -391,150 +402,3 @@ def test_document_contract_remains_required_and_experiment_roundtrip(harness):
     assert Result.model_validate_json(response.model_dump_json()).citations[0].source_locator.kind == "experiment"
     with pytest.raises(ValidationError, match="experiment source identity"):
         Evidence.model_validate({**citation, "document_id": "fake_doc"})
-
-
-class MemoryDatabase:
-    """Exercise repository SQL decisions without a local PostgreSQL server."""
-    def __init__(self, context):
-        self.context = context
-        self.snapshots = {}
-        self.active = True
-        self.statements = []
-
-    def execute(self, statement, parameters):
-        self.statements.append(statement)
-        row = None
-        if "SELECT team_id FROM" in statement:
-            if self.active and parameters == (self.context.run_id, self.context.lease_token):
-                row = {"team_id": self.context.team_id}
-        elif "INSERT INTO agent.run_experiment_snapshots" in statement:
-            self.snapshots.setdefault(parameters[0], copy.deepcopy(parameters[1].obj))
-        elif "SELECT snapshot FROM" in statement:
-            if parameters[0] in self.snapshots:
-                row = {"snapshot": copy.deepcopy(self.snapshots[parameters[0]])}
-        else:
-            raise AssertionError(statement)
-        return types.SimpleNamespace(fetchone=lambda: row)
-
-    @contextmanager
-    def connection(self, *_args, **_kwargs):
-        yield self
-
-
-def test_version_one_snapshot_is_rejected_without_recapture(source, monkeypatch):
-    context = ToolExecutionContext(uuid4(), uuid4(), team_id=source.team_id)
-    database = MemoryDatabase(context)
-    snapshot = experiments.capture_snapshot(source)
-    snapshot["method_version"] = "1"
-    database.snapshots[context.run_id] = copy.deepcopy(snapshot)
-    monkeypatch.setattr(experiments, "connect", database.connection)
-    def unexpected_capture(*args):
-        pytest.fail("An incompatible persisted snapshot must not be replaced")
-    monkeypatch.setattr(experiments, "capture_snapshot", unexpected_capture)
-    with pytest.raises(RecoverableToolError) as error:
-        experiments.load_snapshot(context, source)
-    assert error.value.code == "EXPERIMENT_SNAPSHOT_INCOMPATIBLE"
-    assert database.snapshots[context.run_id] == snapshot
-    assert not any("INSERT INTO" in statement for statement in database.statements)
-
-
-def test_snapshot_survives_file_changes_resume_and_requires_valid_lease(source, monkeypatch):
-    context = ToolExecutionContext(uuid4(), uuid4(), team_id=source.team_id)
-    database = MemoryDatabase(context)
-    monkeypatch.setattr(experiments, "connect", database.connection)
-    first = experiments.load_snapshot(context, source)
-    config_path = source.root / "experiments" / BASE / "config.yaml"
-    config_path.write_text("changed source; must not be read on resume")
-    restored = ToolExecutionContext(context.run_id, context.lease_token, team_id=source.team_id)
-    assert experiments.load_snapshot(restored, source) == first
-    assert sum("INSERT INTO" in query for query in database.statements) == 1
-    assert any("FOR UPDATE" in query for query in database.statements)
-    database.active = False
-    with pytest.raises(PermissionError):
-        experiments.load_snapshot(restored, source)
-
-
-def test_snapshot_root_changes_and_durable_team_mismatch_are_rejected(source, monkeypatch):
-    context = ToolExecutionContext(uuid4(), uuid4(), team_id=source.team_id)
-    database = MemoryDatabase(context)
-    monkeypatch.setattr(experiments, "connect", database.connection)
-    experiments.load_snapshot(context, source)
-    with pytest.raises(RecoverableToolError) as error:
-        experiments.load_snapshot(context, experiments.Settings(source.root / "other", source.team_id))
-    assert error.value.code == "EXPERIMENT_SNAPSHOT_INCOMPATIBLE"
-    forged = ToolExecutionContext(context.run_id, context.lease_token, team_id=uuid4())
-    with pytest.raises(FatalToolError):
-        experiments.load_snapshot(forged, source)
-
-
-class ToolScriptModel(FakeMessagesListChatModel):
-    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
-        return self
-
-    def with_structured_output(self, schema, **kwargs):
-        def value(messages):
-            prompt = json.loads(messages[-1][1])
-            evidence = prompt["available_evidence"][-1]
-            assert "simulated" in prompt["required"]
-            return execution.FinalDraft(answer="合成实验：注意力准确率增加 5.5 个百分点。",
-                claims=[execution.DraftClaim(text="合成实验增加 5.5 个百分点。", support="evidence",
-                                             evidence_ids=[evidence["evidence_id"]])])
-        return RunnableLambda(value)
-
-
-def test_actual_agent_graph_uses_provider_budget_trace_checkpoints_and_final_citations(source, monkeypatch):
-    context = ToolExecutionContext(uuid4(), uuid4(), team_id=source.team_id)
-    database = MemoryDatabase(context)
-    monkeypatch.setattr(experiments, "connect", database.connection)
-    monkeypatch.setenv("AGENT_TOOL_PROVIDERS", "agent_service.tools.experiments:tools")
-    monkeypatch.setenv("AGENT_EXPERIMENT_ROOT", str(source.root))
-    monkeypatch.setenv("AGENT_EXPERIMENT_TEAM_ID", str(source.team_id))
-    requests = [
-        ("search_experiments", {"filters": {VARIABLE: True}}),
-        ("find_experiment_controls", {"baseline_id": BASE, "changed_paths": [VARIABLE]}),
-        ("compare_experiment_metrics", {"left_id": BASE, "right_id": ATTENTION, "changed_paths": [VARIABLE]}),
-    ]
-    model = ToolScriptModel(responses=[AIMessage(content="", tool_calls=[{"name": name, "args": args,
-                           "id": f"call-{index}", "type": "tool_call"}]) for index, (name, args) in enumerate(requests)]
-                           + [AIMessage(content="Analysis completed")])
-    monkeypatch.setattr(execution, "model", lambda: model)
-    reserved, settled = [], []
-    monkeypatch.setattr(execution, "reserve_model", lambda *_args, **_kwargs: uuid4())
-    monkeypatch.setattr(execution, "settle_model", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(tooling, "reserve_tool", lambda *args, **_kwargs: reserved.append(args) or uuid4())
-    monkeypatch.setattr(tooling, "settle_tool", lambda *args, **kwargs: settled.append((args, kwargs)) or True)
-    saver = InMemorySaver()
-    graph = execution.react_agent(saver)
-    config = {"configurable": {"thread_id": str(context.run_id)}}
-    result = graph.invoke({"messages": [("user", "比较仅注意力不同的两个实验")]}, config=config, context=context)
-    assert [row[2] for row in reserved] == [request[0] for request in requests]
-    assert all(row[0][3] == "succeeded" and row[1]["evidence_ids"] for row in settled)
-    assert all(set(row[3]) == {"argument_names", "arguments_sha256"} for row in reserved)
-    assert all(row[5] is not None for row in reserved)  # Triggering model call is recorded.
-    assert len(database.snapshots) == 1
-    checkpoint = graph.get_state(config)
-    assert any(isinstance(message, ToolMessage) for message in checkpoint.values["messages"])
-    restored = ToolExecutionContext(context.run_id, context.lease_token, team_id=source.team_id)
-    execution.collect_evidence(checkpoint.values["messages"], restored.evidence)
-    assert restored.evidence == context.evidence and not restored.notices
-    draft = execution.final_generate("比较注意力", [str(result["messages"][-1].content)], restored, False)
-    final = Result.model_validate(draft)
-    assert len(final.citations) == 1 and final.citations[0].source_locator.kind == "experiment"
-    assert final.notices == [experiments.SYNTHETIC_NOTICE]
-
-
-def test_budget_rejection_precedes_read_and_recoverable_error_settles_failed(harness, monkeypatch):
-    request = types.SimpleNamespace(runtime=harness.runtime,
-        tool_call={"id": "test-call", "name": "read_experiment", "args": {"experiment_id": "missing"}})
-    def exhausted(*args, **kwargs):
-        raise BudgetExhausted("tool")
-    monkeypatch.setattr(tooling, "reserve_tool", exhausted)
-    with pytest.raises(BudgetExhausted):
-        tooling.budgeted_tool.wrap_tool_call(request, lambda _: harness.invoke("read_experiment", experiment_id=BASE))
-    assert not harness.calls
-    settled = []
-    monkeypatch.setattr(tooling, "reserve_tool", lambda *_args: uuid4())
-    monkeypatch.setattr(tooling, "settle_tool", lambda *args, **kwargs: settled.append((args, kwargs)) or True)
-    result = tooling.budgeted_tool.wrap_tool_call(request, lambda _: harness.invoke("read_experiment", experiment_id="missing"))
-    assert result.status == "error" and json.loads(result.content)["code"] == "EXPERIMENT_NOT_FOUND"
-    assert settled[0][0][3] == "failed" and settled[0][1]["error_code"] == "EXPERIMENT_NOT_FOUND"

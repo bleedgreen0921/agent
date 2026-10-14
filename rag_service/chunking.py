@@ -17,7 +17,7 @@ class ChunkDraft:
 def tokenizer():
     from transformers import AutoTokenizer
 
-    return AutoTokenizer.from_pretrained(os.environ.get("RAG_TOKENIZER_PATH", "Qwen/Qwen3-Embedding-0.6B"), use_fast=True)
+    return AutoTokenizer.from_pretrained(os.environ.get("RAG_TOKENIZER_PATH", "Qwen/Qwen3-Embedding-0.6B"), use_fast=True, local_files_only=True)
 
 
 def embedding_input(title: str, chunk: ChunkDraft) -> str:

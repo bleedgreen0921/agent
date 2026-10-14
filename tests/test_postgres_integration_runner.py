@@ -13,12 +13,12 @@ from scripts import postgres_integration as runner
 
 def test_integration_environment_overrides_production_and_drops_model_credentials(tmp_path):
     base = {name: "production-setting" for name in (
-        "MIGRATION_DATABASE_URL", "AGENT_DATABASE_URL", "RAG_DATABASE_URL", "IDENTITY_ADMIN_DATABASE_URL",
+        "MIGRATION_DATABASE_URL", "AGENT_DATABASE_URL", "RAG_DATABASE_URL",
         "OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_MODEL_KEY", "AGENT_MODEL_URL", "AGENT_TOOL_PROVIDERS",
-        "AGENT_EXPERIMENT_ROOT", "AGENT_EXPERIMENT_TEAM_ID", "PYTEST_ADDOPTS", "PYTEST_PLUGINS")}
+        "AGENT_EXPERIMENT_ROOT", "PYTEST_ADDOPTS", "PYTEST_PLUGINS")}
     base["POSTGRES_INTEGRATION_PASSWORD"] = "local-only-owner-password"
     env = runner.test_environment(base, 55432, tmp_path)
-    for name in ("MIGRATION_DATABASE_URL", "AGENT_DATABASE_URL", "RAG_DATABASE_URL", "IDENTITY_ADMIN_DATABASE_URL"):
+    for name in ("MIGRATION_DATABASE_URL", "AGENT_DATABASE_URL", "RAG_DATABASE_URL"):
         parsed = urlsplit(env[name])
         assert parsed.hostname == "127.0.0.1" and parsed.port == 55432
         assert parsed.path == "/research_agent_integration" and parsed.password

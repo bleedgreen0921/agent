@@ -102,9 +102,9 @@ def _manifest(row):
 
 def trace_run(run_id: UUID, include_candidates: bool = False) -> dict:
     with readonly_connection("AGENT_DATABASE_URL") as conn:
-        run = conn.execute("""SELECT id,team_id,mode,status,created_at,started_at,finished_at,
+        run = conn.execute("""SELECT id,mode,status,created_at,started_at,finished_at,
             execution_deadline_at,error_code,termination_reason,model_calls_used,tool_calls_used,
-            model_call_limit,tool_call_limit FROM agent.agent_runs WHERE id=%s""", (run_id,)).fetchone()
+            model_call_limit,tool_call_limit FROM agent.run_state WHERE id=%s""", (run_id,)).fetchone()
         if run is None:
             raise LookupError("Run not found")
         manifest = conn.execute("SELECT schema_version,manifest,captured_at FROM agent.run_manifests WHERE run_id=%s", (run_id,)).fetchone()
@@ -125,8 +125,8 @@ def trace_run(run_id: UUID, include_candidates: bool = False) -> dict:
         audits = conn.execute("""SELECT id,request_id,run_id,tool_call_id,operation,retrieval_id,
             revision_id,status,degradations,created_at,query_sha256,rewritten_query_sha256,
             selected_evidence_ids,evidence_id,error_code,candidate_trace
-            FROM rag.retrieval_audit WHERE run_id=%s AND team_id=%s
-            ORDER BY created_at,id""", (str(run_id), run["team_id"])).fetchall()
+            FROM rag.retrieval_audit WHERE run_id=%s
+            ORDER BY created_at,id""", (str(run_id),)).fetchall()
 
     tools_by_id = {str(row["id"]): row for row in tools}
     audit_by_tool: dict[str, list[dict]] = {}

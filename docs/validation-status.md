@@ -93,3 +93,26 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 本次保留原有的 33 条 Starlette 弃用和 Pydantic 不可变 Mapping 序列化提示，没有新增未 await coroutine、资源或连接泄漏提示。合成结果证明机制与集成行为，不评价实际 LLM 的科研判断能力。
 
 升级当前第二阶段个人库需停止旧执行链、备份数据库、处理残留协议 1 任务后运行增量迁移和授权；不重新初始化个人库。见 [异步执行层](async-execution.md)。本轮只修改工作区并操作隔离测试数据库，未升级正在使用的个人数据库。
+
+## 第四阶段：调用适配、业务链与 Worker 职责收敛
+
+2026-10-13 完成 CallRunner、显式 AgentCallStore、Attempt／Call 上下文、统一控制异常、模型与工具适配、共享 Embedding 验证、实验纯计算入口、Agent runner、Memory／RAG 分支整理及 Worker 执行结果接入。首次认领的 Manifest 准备移动到事务前；正式 Worker 启动时准备并复用 Provider／配置模板。协议和数据库 schema 不变。
+
+正式全量验收：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55449`。
+报告目录：`.data/postgres-integration/rap-test-0654a41895cf/`。
+
+| 检查 | 结果 |
+| --- | --- |
+| 全量测试 | 339 通过；0 失败、0 错误、0 跳过 |
+| 新调用适配专项 | 43 项提交未知、重复预留、控制异常、上下文／期限隔离、Embedding 验证、排队后授权、SDK 流式期限、下游预算、partial、兄弟任务清理、Manifest、usage、受控同步工具、真实 SDK 包装控制信号、受控输入准备、文档消费和离线模型加载验证 |
+| 三个实验数据库专项 | 全部通过，两种模式使用直接的 CPU 计算入口并保留引用 |
+| doctor／迁移／权限 | 隔离库初始化和已有迁移 head 验证通过；没有新增第四阶段迁移 |
+| 资源与持久回归 | 原容量、CPU 回收、停止、未知提交及调用回执测试继续通过 |
+| 警告 | 原有 33 条 Starlette／Pydantic 警告；无新增未 await coroutine、连接或执行器泄漏警告 |
+| 静态／编译 | git diff --check、compileall 通过；图无预算／结算实现，Worker 无执行 SQL 或模型／解析异常分类 |
+
+实际启动冒烟报告：`.data/postgres-integration/rap-test-17f92c3b6530/phase4-smoke/summary.json`，对应服务日志同目录。两个正式 API、两个异步 Worker 与本机合成模型服务完成：文档 active、ReAct 和 Plan 各一个有效引用、Memory 提取和摘要完成，共 30 条调用回执。两个 Worker 收到 SIGTERM 后均以 0 退出，两个 API 完成 Uvicorn 正常关闭后按 SIGTERM 约定退出。服务日志没有 ERROR、Traceback、未消费任务异常或超期清理记录。
+
+全量测试和冒烟分别使用隔离数据库；没有访问真实模型或正在使用的个人数据库。测试数据库在验证结束后清理。发布继续沿用排空并停止 Worker、更新代码、启动验收的流程，详见 [调用适配说明](call-adapters.md)。
+
+最终边界检查补齐 CPU 模型本地加载：tokenizer 禁止远程元数据请求，PDF 向 Docling 传入本地 artifacts，CPU 子进程使用 HF／Transformers 离线模式。OCR 与表格处理保持开启；PDF 模型缓存需在部署准备时提供。

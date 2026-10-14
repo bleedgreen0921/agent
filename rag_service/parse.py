@@ -17,13 +17,13 @@ class ParseFailure(ValueError):
     pass
 
 
-def parse_file(path: Path, media_type: str) -> tuple[list[Block], list[str]]:
+def parse_file(path: Path, media_type: str, *, local_models: bool=False) -> tuple[list[Block], list[str]]:
     if media_type == "text/plain":
         return parse_txt(path.read_bytes()), []
     if media_type == "text/markdown":
         return parse_markdown(path.read_text(encoding="utf-8-sig")), []
     if media_type in ("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
-        return parse_docling(path, "pdf" if media_type == "application/pdf" else "docx")
+        return parse_docling(path, "pdf" if media_type == "application/pdf" else "docx", local_models=local_models)
     raise ParseFailure("UNSUPPORTED_FORMAT")
 
 
@@ -77,12 +77,28 @@ def parse_markdown(text: str) -> list[Block]:
     return blocks
 
 
-def parse_docling(path: Path, kind: str) -> tuple[list[Block], list[str]]:
+def parse_docling(path: Path, kind: str, *, local_models: bool=False) -> tuple[list[Block], list[str]]:
     from docling.document_converter import DocumentConverter
 
     try:
-        result = DocumentConverter().convert(path)
+        if local_models and kind == 'pdf':
+            # Explicit artifacts prevent Docling's default lazy HF downloads in
+            # the CPU worker. OCR/table/layout behavior remains enabled.
+            from docling.datamodel.settings import settings
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.datamodel.base_models import InputFormat
+            from docling.document_converter import PdfFormatOption
+            artifacts = settings.artifacts_path or settings.cache_dir / 'models'
+            if not artifacts.is_dir():
+                raise ParseFailure('PARSER_MODELS_NOT_CONFIGURED')
+            converter = DocumentConverter(format_options={InputFormat.PDF:
+                PdfFormatOption(pipeline_options=PdfPipelineOptions(artifacts_path=artifacts))})
+        else:
+            converter = DocumentConverter()
+        result = converter.convert(path)
         document = result.document
+    except ParseFailure:
+        raise
     except Exception as exc:
         raise ParseFailure("PARSE_FAILED") from exc
     blocks: list[Block] = []
