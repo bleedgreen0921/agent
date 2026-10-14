@@ -1,16 +1,53 @@
 """Build the immutable execution manifest captured when a Run is claimed."""
 
 import hashlib
+import json
+import inspect
+from importlib.metadata import version
 import os
 import subprocess
 from functools import lru_cache
 from pathlib import Path
 
-from agent_service.versions import GRAPH_VERSION, MANIFEST_SCHEMA_VERSION, PROMPT_SET_VERSION
+from agent_service.versions import GRAPH_VERSION, MANIFEST_SCHEMA_VERSION, PROMPT_SET_VERSION, STATE_SCHEMA_VERSION, RECOVERY_CONTRACT_VERSION
 from agent_service.timeouts import configured_timeouts
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def recovery_contract(providers) -> dict:
+    """Fail closed on implementation/schema drift even if a version was not bumped."""
+    paths = sorted(str(path.relative_to(REPOSITORY_ROOT))
+                   for package in ('agent_service', 'execution', 'experiment_service', 'contracts')
+                   for path in (REPOSITORY_ROOT / package).rglob('*.py') if 'migrations' not in path.relative_to(REPOSITORY_ROOT).parts)
+    if not paths:
+        raise RuntimeError('Recovery manifest requires executable source artifacts')
+    implementation = {path: hashlib.sha256((REPOSITORY_ROOT / path).read_bytes()).hexdigest() for path in paths}
+    tools = []
+    for factory, provider in providers:
+        for declaration in provider.tools:
+            tool = declaration.tool
+            schema = tool.tool_call_schema
+            if not isinstance(schema, dict):
+                schema = schema.model_json_schema()
+            implementation_fn = getattr(tool, 'coroutine', None) or type(tool)._arun
+            source = inspect.getsourcefile(implementation_fn)
+            source_digest = hashlib.sha256(Path(source).read_bytes()).hexdigest() if source and Path(source).is_file() else None
+            # A provider without inspectable code must deliberately version its
+            # implementation; its declared versions and schema remain compared.
+            tools.append({'factory': factory, 'name': tool.name, 'schema': schema,
+                          'description': tool.description, 'implementation_sha256': source_digest})
+    from agent_service.schemas import Plan, FinalDraft
+    from contracts.v1 import Evidence
+    payload = {'implementation': implementation, 'tools': tools,
+               'schemas': {s.__name__: s.model_json_schema() for s in (Plan, FinalDraft, Evidence)},
+               'dependencies': {name: version(name) for name in ('langgraph', 'langchain', 'langchain-core',
+                   'langgraph-checkpoint', 'langgraph-checkpoint-postgres', 'langchain-openai', 'pydantic',
+                   'openai', 'httpx', 'psycopg')}}
+    return {'version': RECOVERY_CONTRACT_VERSION, 'state_schema_version': STATE_SCHEMA_VERSION,
+            'sha256': hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest(),
+            'legacy_policy': 'reject', 'state_migration': 'none'}
 
 
 @lru_cache(maxsize=1)
@@ -44,17 +81,19 @@ def application_revision() -> dict:
     return {"revision": "unknown", "revision_source": "unknown", "dirty": False}
 
 
-def execution_manifest() -> dict:
+def execution_manifest(*, providers=None) -> dict:
     from agent_service.tooling import load_providers
     timeouts = configured_timeouts()
     model_url = os.environ.get("AGENT_MODEL_URL", "")
-    providers = load_providers()
+    providers = load_providers() if providers is None else providers
     return {
         "application": application_revision(),
         "agent": {
             "graph_version": GRAPH_VERSION,
+            "recovery_protocol": 2,
             "prompt_set_version": PROMPT_SET_VERSION,
         },
+        "recovery_contract": recovery_contract(providers),
         "model": {
             "protocol": "openai-compatible-chat",
             "name": os.environ.get("AGENT_MODEL", ""),
@@ -63,9 +102,9 @@ def execution_manifest() -> dict:
             "max_retries": 0,
         },
         "tools": {"providers": [
-            {"factory": spec, "name": provider.name, "version": provider.version,
+            {"factory": spec, "name": provider.name, "version": provider.version, "contract_version": provider.contract_version,
              "tools": [{"name": item.tool.name, "version": item.version, "kind": item.kind,
-                        "produces_evidence": item.produces_evidence} for item in provider.tools]}
+                        "produces_evidence": item.produces_evidence, "intent_spec": {"operation":item.intent_spec.operation,"effect_fields":list(item.intent_spec.effect_fields)} if item.intent_spec else None} for item in provider.tools]}
             for spec, provider in providers
         ]},
         "limits": {

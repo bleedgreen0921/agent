@@ -166,3 +166,15 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 最终验收：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55455`。
 报告：`.data/postgres-integration/rap-test-c0941cad2f5d/`。
 结果：422 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor 与三个实验数据库专项通过；相关模块 compileall、git diff --check 通过。专用容器已清理，未操作个人数据库，无新增 schema 迁移。契约说明见 [execution-contract.md](execution-contract.md)。
+
+## C01–C03：恢复兼容、有限事务重试与提交未知核查
+
+2026-10-13 复核确认 Manifest 与生产 CallContext 的稳定调用身份已有部分保护，但恢复检查不完整、明确回滚后没有统一事务重试、提交未知缺少统一的身份与核查结果。本轮新增 Manifest schema 4 的完整恢复契约、`TransactionRolledBack` 有限重试和 OperationIdentity／Resolution 核查。认领与执行入口均拒绝不兼容状态；输入准备和外部请求不进入事务重试；预留未知不发送请求，结算和最终发布核实已提交数据后可确认成功。
+
+新增 46 项验证，包括七类恢复版本／schema 不兼容、直接执行入口与 Worker 缓存后的实现变更、工具 schema／描述／依赖／源代码变化、真实数据库死锁和 REPEATABLE READ 写冲突、事务中途及 COMMIT 阶段确认回滚、稳定调用 ID 与预算、三次总尝试及嵌套限制、随机等待与期限／取消、不重试连接和唯一约束错误、真实提交后响应丢失、实际回滚后的未知响应、模型仅执行一次、最终结果仅发布一次、核查不可用、核查等待在途提交、跨 Run 身份冲突及不完整恢复描述。数据库竞争使用锁与事件屏障。
+
+最终验收：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55459`。
+报告：`.data/postgres-integration/rap-test-8590f76093b0/`。
+结果：468 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor、数据库角色权限、三条迁移链和三个实验数据库专项通过；专用容器已清理，未操作个人数据库。相关模块编译与 git diff --check 通过。
+
+本轮新增 `agent_personal_0003` 增量迁移，仅扩展 Manifest schema 约束；个人数据库仍需在停止旧 API／Worker并备份后执行 migrate、bootstrap 和 doctor。旧 Manifest／checkpoint 不转换、不伪造回执，已有历史结果保留。部署规则和实现边界见 [恢复与事务说明](recovery-and-transactions.md)。

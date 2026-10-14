@@ -43,6 +43,7 @@ from execution import store
 from execution.persistence import resources, transaction, deadline
 from execution.infra.types import WorkOwner
 from agent_service.storage.receipts import markers, confirm, MARKER_CHANNEL
+from execution.retry import retry_transaction
 
 
 class ProtectedSaver(AsyncPostgresSaver):
@@ -82,6 +83,7 @@ class ProtectedSaver(AsyncPostgresSaver):
 
 
 
+    @retry_transaction
     async def aput(self,config,checkpoint,metadata,new_versions):
         await self._validate_thread(config)
         cfg=config['configurable']; thread=cfg['thread_id']; ns=cfg.get('checkpoint_ns',''); cp=checkpoint['id']
@@ -110,6 +112,7 @@ class ProtectedSaver(AsyncPostgresSaver):
             await store.assert_active(conn,self.task,self.token)
         return {'configurable':{'thread_id':thread,'checkpoint_ns':ns,'checkpoint_id':cp}}
 
+    @retry_transaction
     async def aput_writes(self,config,writes,task_id,task_path=''):
         await self._validate_thread(config)
         cfg=config['configurable']; thread=cfg['thread_id']; ns=cfg.get('checkpoint_ns',''); cp=cfg['checkpoint_id']
@@ -138,6 +141,7 @@ class ProtectedSaver(AsyncPostgresSaver):
             value['metadata'],{'configurable':{'thread_id':value['thread_id'],'checkpoint_ns':value['checkpoint_ns'],'checkpoint_id':value['parent_checkpoint_id']}} if value['parent_checkpoint_id'] else None,
             self._load_writes(value['pending_writes']))
 
+    @retry_transaction
     async def aget_tuple(self,config):
         await self._validate_thread(config)
         cfg=config['configurable']; args=[cfg['thread_id'],cfg.get('checkpoint_ns','')]
