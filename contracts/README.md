@@ -15,6 +15,7 @@
 | 上传版本、读取状态 | `POST /v1/documents/{id}/versions`、`GET /v1/documents/{id}/versions/{version_id}` |
 | 两个服务各自的 Worker | `GET /v1/workers` |
 | 服务证据调用 | `POST /v1/evidence/search`、`GET /v1/evidence/{id}` |
+| 服务搜索核实 | `GET /v1/evidence/operations/{id}` |
 | 健康与就绪 | `/health`、`/health/ready` |
 
 Run 的 `Idempotency-Key` 在实例内唯一；轮次必须提供该头，作用域为会话；文档创建与新增版本按操作分别去重。同键输入冲突返回 409。Run 列表支持状态、带时区的创建时间、游标，默认 30、最多 100 项。游标只携带位置及业务过滤条件。
@@ -29,3 +30,7 @@ Run 的 `Idempotency-Key` 在实例内唯一；轮次必须提供该头，作用
 第三阶段：Worker 状态字段使用 `memory_consumer_alive`；时间线调用 details 增加 `checkpoint_receipts`，Run 创建事件的 details 增加 `recovery_protocol`。Agent→RAG 可传 `X-Request-Budget-Seconds` 缩短搜索期限；必须保持服务认证和 Run／调用关联头，预算头不构成执行权。业务路径和状态映射保持不变。
 
 Run 与会话轮次请求可选 `tool_authorizations`，默认为空，仅在需要副作用工具时显式指定动作、目标和次数。公开 Result 增加可选 `acceptance` 报告，历史结果为空；时间线新增 `verification` 事件，只包含安全关联和统计。见 [验收说明](../docs/acceptance.md)。
+
+Run 响应增加 `token_usage`，搜索响应增加 `usage`：包含 `token_limit`、`charged`、实际输入／输出 token、`unconfirmed_tokens`、估计调用数和 `blocked`。未确认预留继续占额，不等同于服务端实际用量；尚未调用时限额可为 null。没有货币费用字段。
+
+Agent 搜索使用 `X-Token-Allocation` 签名有限配额，绑定请求、Run、工具调用、模型策略和期限；该头不替代服务认证。搜索核实接口使用同样的认证及关联头，只读取该操作的状态和已存结果，不能重发模型或搜索。额度耗尽可以保留 FTS／融合结果并标记降级。调用归档正文不通过这些公共接口开放。详见 [上下文与保留协议](../docs/context-and-retention.md)。

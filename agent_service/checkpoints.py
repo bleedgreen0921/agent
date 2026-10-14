@@ -48,11 +48,32 @@ from execution.retry import retry_transaction
 
 class ProtectedSaver(AsyncPostgresSaver):
     """One pool borrow per operation; graph SQL and receipts commit together."""
+    STORAGE_WARNING_BYTES = 64 * 1024 * 1024
     def __init__(self, task, token):
         super().__init__(resources().db.pools['normal'])
         self.task, self.token = task, token
         self.owner = WorkOwner(task, token)
+        self._storage_checks = 0
+        self._storage_warned = False
 
+    async def _check_storage(self):
+        # Diagnostics run after commit and never hold the execution-authority lock.
+        self._storage_checks += 1
+        if self._storage_warned or (self._storage_checks-1) % 32: return
+        import logging
+        try:
+            async with transaction('AGENT_DATABASE_URL', readonly=True) as conn:
+                row = await (await conn.execute('''SELECT
+                    (SELECT coalesce(sum(pg_column_size(checkpoint)+pg_column_size(metadata)),0) FROM agent.checkpoints WHERE thread_id=%s OR starts_with(thread_id,%s))+
+                    (SELECT coalesce(sum(octet_length(blob)),0) FROM agent.checkpoint_blobs WHERE thread_id=%s OR starts_with(thread_id,%s))+
+                    (SELECT coalesce(sum(octet_length(blob)),0) FROM agent.checkpoint_writes WHERE thread_id=%s OR starts_with(thread_id,%s))+
+                    (SELECT coalesce(sum(octet_length(body)),0) FROM agent.execution_bodies WHERE run_id=%s) AS bytes''',
+                    (*([str(self.task.id),str(self.task.id)+':step:']*3),self.task.id))).fetchone()
+            if row['bytes'] >= self.STORAGE_WARNING_BYTES:
+                self._storage_warned = True
+                logging.getLogger(__name__).warning('Run checkpoint storage exceeds warning threshold: run_id=%s bytes=%s',self.task.id,row['bytes'])
+        except Exception:
+            logging.getLogger(__name__).warning('Checkpoint storage measurement unavailable: run_id=%s',self.task.id)
 
     async def _validate_thread(self, config):
         from execution.scope import track_call_task
@@ -81,7 +102,35 @@ class ProtectedSaver(AsyncPostgresSaver):
     async def _data(self, fn, *args):
         return await resources().io.run(fn,*args,owner=self.owner,deadline=deadline())
 
+    async def _externalize(self,params):
+        import json
+        from agent_service.storage.bodies import put_bytes
+        output=[]
+        for row in params:
+            kind,body=row[-2:]
+            if body is not None and len(body)>=4096:
+                ref=await put_bytes(self.task.id,self.token,kind,bytes(body))
+                row=(*row[:-2],'execution-ref-v1',json.dumps(ref,separators=(',',':')).encode())
+            output.append(row)
+        if sum(len(row[-1] or b'') for row in output)>1024*1024:
+            from execution.persistence import PersistenceOutcomeUnknown
+            raise PersistenceOutcomeUnknown('Checkpoint exceeds maximum persisted record size')
+        return output
 
+    async def _expand(self,value):
+        if not value:return value
+        import json
+        from agent_service.storage.bodies import get_bytes,REF
+        result=dict(value)
+        for key in ('channel_values','pending_writes'):
+            rows=[]
+            for row in result.get(key) or []:
+                if row[-2]==b'execution-ref-v1':
+                    ref=json.loads(row[-1]);body=await get_bytes(self.task.id,self.token,ref)
+                    row=(*row[:-2],ref[REF]['format'].encode(),body)
+                rows.append(row)
+            result[key]=rows
+        return result
 
     @retry_transaction
     async def aput(self,config,checkpoint,metadata,new_versions):
@@ -91,7 +140,13 @@ class ProtectedSaver(AsyncPostgresSaver):
         blobs={k:copy['channel_values'].pop(k) for k,v in checkpoint['channel_values'].items()
                if v is not None and (not isinstance(v,(str,int,float,bool)) or isinstance(v,str) and len(v.encode())>=4096)}
         params=await self._data(self._dump_blobs,thread,ns,blobs,{k:v for k,v in new_versions.items() if k in blobs})
+        params=await self._externalize(params)
         meta=get_serializable_checkpoint_metadata(config,metadata)
+        import json
+        header_size=await self._data(lambda value:len(json.dumps(value,default=str).encode()),(copy,meta))
+        if header_size+sum(len(p[-1] or b'') for p in params)>1024*1024:
+            from execution.persistence import PersistenceOutcomeUnknown
+            raise PersistenceOutcomeUnknown('Checkpoint header exceeds maximum persisted record size')
         async with transaction('AGENT_DATABASE_URL') as conn:
             await conn.execute('SET LOCAL search_path=agent')
             await store.assert_active(conn,self.task,self.token)
@@ -110,6 +165,7 @@ class ProtectedSaver(AsyncPostgresSaver):
                 if not row: raise ValueError('Checkpoint output was not persisted')
                 await confirm(conn,self.task.id,self.token,calls,source='checkpoint',thread=thread,ns=ns,checkpoint_id=cp,channel=channel,digest=row['digest'])
             await store.assert_active(conn,self.task,self.token)
+        await self._check_storage()
         return {'configurable':{'thread_id':thread,'checkpoint_ns':ns,'checkpoint_id':cp}}
 
     @retry_transaction
@@ -117,6 +173,7 @@ class ProtectedSaver(AsyncPostgresSaver):
         await self._validate_thread(config)
         cfg=config['configurable']; thread=cfg['thread_id']; ns=cfg.get('checkpoint_ns',''); cp=cfg['checkpoint_id']
         params=await self._data(self._dump_writes,thread,ns,cp,task_id,task_path,writes)
+        params=await self._externalize(params)
         query=self.UPSERT_CHECKPOINT_WRITES_SQL if all(w[0] in WRITES_IDX_MAP for w in writes) else self.INSERT_CHECKPOINT_WRITES_SQL
         async with transaction('AGENT_DATABASE_URL') as conn:
             await conn.execute('SET LOCAL search_path=agent')
@@ -133,6 +190,7 @@ class ProtectedSaver(AsyncPostgresSaver):
                     raise ValueError('Pending write conflict')
                 await confirm(conn,self.task.id,self.token,calls,source='pending_write',thread=thread,ns=ns,checkpoint_id=cp,channel=channel,digest=row['digest'],graph_task_id=task_id,write_idx=index)
             await store.assert_active(conn,self.task,self.token)
+        await self._check_storage()
 
     def _decode(self,value):
         if value['checkpoint']['v']<4: raise ValueError('Historical checkpoint execution is unsupported')
@@ -150,7 +208,7 @@ class ProtectedSaver(AsyncPostgresSaver):
         else: query+=' ORDER BY checkpoint_id DESC LIMIT 1'
         async with self._cursor() as cur:
             await cur.execute(query,args,binary=True); value=await cur.fetchone()
-        return await self._data(self._decode,value) if value else None
+        return await self._data(self._decode,await self._expand(value)) if value else None
 
     async def alist(self,config,*,filter=None,before=None,limit=None):
         if config is None: raise PermissionError('A bound thread is required')
@@ -161,7 +219,7 @@ class ProtectedSaver(AsyncPostgresSaver):
         if limit is not None: query+=' LIMIT %s'; args=[*args,int(limit)]
         async with self._cursor() as cur:
             await cur.execute(query,args,binary=True); values=await cur.fetchall()
-        for value in values: yield await self._data(self._decode,value)
+        for value in values: yield await self._data(self._decode,await self._expand(value))
 
     async def adelete_thread(self,thread_id):
         raise PermissionError('Runtime checkpoint deletion is disabled')

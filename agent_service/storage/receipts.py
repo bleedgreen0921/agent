@@ -101,6 +101,7 @@ async def anchor_valid(conn,r):
 
 
 async def resumable(conn, run_id):
+    if not await dependencies_valid(conn,run_id):return False
     run = await (await conn.execute('SELECT recovery_protocol FROM agent.agent_runs WHERE id=%s',(run_id,))).fetchone()
     if not run or run['recovery_protocol'] != 2: return False
     calls = await (await conn.execute('''SELECT 'model' AS kind,id,status FROM agent.model_calls WHERE run_id=%s
@@ -122,12 +123,32 @@ async def resumable(conn, run_id):
     return True
 
 
+async def dependencies_valid(conn,run_id):
+    import json
+    from agent_service.storage.bodies import validate
+    refs=await (await conn.execute('''SELECT blob FROM agent.checkpoint_blobs WHERE type='execution-ref-v1'
+        AND (thread_id=%s OR thread_id LIKE %s) UNION ALL
+        SELECT blob FROM agent.checkpoint_writes WHERE type='execution-ref-v1'
+        AND (thread_id=%s OR thread_id LIKE %s)''',(str(run_id),str(run_id)+':step:%',str(run_id),str(run_id)+':step:%'))).fetchall()
+    try:
+        for row in refs:await validate(conn,run_id,json.loads(bytes(row['blob'])))
+        import hashlib
+        pinned=await (await conn.execute('SELECT b.sha256,b.format,b.body FROM agent.body_pins p JOIN agent.execution_bodies b USING(run_id,sha256) WHERE p.run_id=%s',(run_id,))).fetchall()
+        for row in pinned:
+            if hashlib.sha256(row['format'].encode()+b'\0'+bytes(row['body'])).hexdigest()!=row['sha256']:return False
+    except (ValueError,KeyError,TypeError):return False
+    # Per-call evidence dependencies are part of the real pending write body.
+    # All bodies are retained for a live Run, even those not in its latest view.
+    return True
 
 
 def resumable_offline(conn,run_id):
     """Owner diagnostic only; shares the exact anchor SQL and digest rules."""
     run=conn.execute('SELECT recovery_protocol FROM agent.agent_runs WHERE id=%s',(run_id,)).fetchone()
     if not run or run['recovery_protocol']!=2:return False
+    import hashlib
+    for row in conn.execute('SELECT b.sha256,b.format,b.body FROM agent.body_pins p JOIN agent.execution_bodies b USING(run_id,sha256) WHERE p.run_id=%s',(run_id,)).fetchall():
+        if hashlib.sha256(row['format'].encode()+b'\0'+bytes(row['body'])).hexdigest()!=row['sha256']:return False
     calls=conn.execute("SELECT 'model' AS kind,id,status FROM agent.model_calls WHERE run_id=%s UNION ALL SELECT 'tool',id,status FROM agent.tool_calls WHERE run_id=%s",(run_id,run_id)).fetchall()
     receipts=conn.execute('SELECT * FROM agent.call_checkpoint_receipts WHERE run_id=%s',(run_id,)).fetchall()
     steps={str(run_id)+':step:'+str(r['ordinal']) for r in conn.execute('SELECT ordinal FROM agent.run_steps WHERE run_id=%s',(run_id,)).fetchall()}

@@ -210,3 +210,19 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 正式入口冒烟：`.data/postgres-integration/rap-flow-smoke-1129358d91ae/services/summary.json`。默认下游限流配置下，两个 API 和两个 Worker 完成文档处理、ReAct、Plan、会话事实提取和摘要；两种 Agent 各有有效引用，生成 108 条实际图调用回执。关闭日志没有资源泄漏或异常，两次验证的专用容器均已清理。
 
 compileall 与 git diff --check 通过。仅验证了专用数据库，没有对当前个人数据库执行迁移、停止服务或部署；现有个人实例的发布步骤见 [acceptance.md](acceptance.md)。语义判断属于模型辅助检查，不承诺绝对正确。
+
+## C18、C19、C20、C21、C22、C24：上下文、保留与 token 计量
+
+2026-10-14 完成完整请求输入预检、模型输出上限、任务 token 账本及有限跨服务配额；证据目录与按需正文加载、每步骤一次受预算约束的摘要、分组最终证据核验；不可变图正文、恢复依赖校验与永久核验 pin；私有请求／响应归档和脱敏；登记产物的隔离回收与窄权限维护角色；检索阶段及容量／限速／连接／执行器等待计时。不增加价格或货币费用功能。
+
+最终验收：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55487`。
+
+报告：`.data/postgres-integration/rap-test-79728546c072/summary.json`。584 通过，失败、错误、跳过均为 0，三个实验数据库专项通过。doctor 验证 migration head 为 execution_0004、rag_personal_0002、agent_personal_0006，角色与 RLS 通过。保留 43 条同类 Starlette／Pydantic 依赖提示，无未 await coroutine、未消费任务异常或资源泄漏提示。真实 HTTP transport 在全量测试中禁用。
+
+新增 23 项测试覆盖：完整 schema／工具输入与输出上限、并发 token 竞争、稳定 ID 不重发、未派发释放和实际 usage 幂等、真实 SDK 请求归档、敏感字段与嵌套 JSON 脱敏、超长请求不发送、真实 checkpoint 回执和正文损坏、活动任务与永久依据保护、隔离后延迟删除、保留 hold、必需证据不可截断、摘要仅一次且需真实回执、分组核验关联全部实际调用与防篡改、提交确认丢失不派发、本地 tokenizer 指纹变化拒绝加载、累计体积告警、跨角色配额与失败状态核实、过期配额与超估阻止发送、实际文件锁与版本引用保护、归档改名／索引中断回收、限流前拒绝释放配额、畸形搜索响应仅查询状态不重发，以及 token 耗尽后 FTS 降级。检索计时在既有候选 trace 测试内增加实际连接等待和 SQL／阶段断言。
+
+正式服务冒烟：`.data/postgres-integration/rap-flow-smoke-51d23006b9e1/services/summary.json`。默认下游额度下，两个 API、两个 Worker 和本机合成模型完成文档 active、ReAct 与 Plan 各一个有效引用、Memory 提取与摘要；108 条实际调用回执。Worker 均以 0 退出，API 完成正常应用关闭后按 SIGTERM 约定退出；没有 ERROR、Traceback、资源泄漏或清理超期。
+
+增量迁移专项：`.data/postgres-integration/rap-upgrade-bc5c175153a9/summary.json`。先初始化旧 head execution_0002／rag_personal_0001／agent_personal_0005，写入历史答案、引用、Manifest 和四类任务，再升级当前 head。历史答案及引用原文、旧 Manifest 和排队期限均不变；仅未开始且无 Manifest 的任务升级 v5。checkpoint 初始化、bootstrap、doctor 和维护角色独立登录及有限回收权限均通过。
+
+所有验证使用独立 PostgreSQL／pgvector 容器并在结束后清理，没有访问真实模型或个人数据库。compileall 与 git diff --check 通过。新图 v5、状态 v3、提示 v4、Manifest schema 6；个人实例仍需按 [上下文与保留协议](context-and-retention.md) 停止旧执行链、备份和增量迁移。维护服务模板已提供，未在个人实例安装或启动。

@@ -11,6 +11,7 @@ class StrictModel(BaseModel):
 
 
 class ErrorCode(StrEnum):
+    INPUT_TOKEN_LIMIT_EXCEEDED = 'INPUT_TOKEN_LIMIT_EXCEEDED'
     SUBMISSION_RATE_LIMITED = "SUBMISSION_RATE_LIMITED"
     QUEUE_CAPACITY_EXCEEDED = "QUEUE_CAPACITY_EXCEEDED"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
@@ -190,9 +191,19 @@ class EvidenceSearchRequest(StrictModel):
     top_k: int = Field(default=5, ge=1, le=20)
 
 
+class TokenUsage(StrictModel):
+    token_limit: int | None = None
+    charged: int = Field(default=0,ge=0)
+    blocked: bool = False
+    calls: int = Field(default=0,ge=0)
+    actual_input_tokens: int = Field(default=0,ge=0)
+    actual_output_tokens: int = Field(default=0,ge=0)
+    unconfirmed_tokens: int = Field(default=0,ge=0)
+    estimated_calls: int = Field(default=0,ge=0)
 
 
 class EvidenceSearchResponse(BaseModel):
+    usage: TokenUsage | None = None
     model_config = ConfigDict(extra="ignore")
     request_id: str
     retrieval_id: str
@@ -254,6 +265,7 @@ class Result(StrictModel):
 
 
 class RunResponse(StrictModel):
+    token_usage: TokenUsage | None = None
     progress: ExecutionProgress | None = None
     run_id: str
     mode: Literal["react", "plan_execute"]

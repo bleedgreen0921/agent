@@ -1,0 +1,21 @@
+[Unit]
+Description=Personal Agent lifecycle maintenance
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+# Replace paths and user before installation.
+User=YOUR_USER
+WorkingDirectory=/absolute/path/to/agent
+EnvironmentFile=/absolute/private/lifecycle.env
+ExecStart=/absolute/path/to/agent/.venv/bin/python -m scripts.lifecycle daemon
+Restart=on-failure
+RestartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/absolute/private/rag-files /absolute/private/call-archives
+
+[Install]
+WantedBy=multi-user.target

@@ -93,6 +93,7 @@ def execution_manifest(*, providers=None) -> dict:
             "graph_version": GRAPH_VERSION,
             "recovery_protocol": 2,
             "prompt_set_version": PROMPT_SET_VERSION,
+            "token_policy": __import__('execution.tokens',fromlist=['configuration']).configuration(),
             "tool_limits": tool_limits(),
             "acceptance_policy": {"version":1,"failure":"partial","repair_calls":0,"final_reserved_calls":2,"side_effects":"explicit_request_grants"},
         },
@@ -111,6 +112,7 @@ def execution_manifest(*, providers=None) -> dict:
             for spec, provider in providers
         ]},
         "limits": {
+            "token_policy": __import__('execution.tokens',fromlist=['configuration']).configuration(),
             "model_calls": 16,
             "tool_calls": 10,
             "execution_timeout_seconds": int(os.environ.get("AGENT_EXECUTION_TIMEOUT_SECONDS", "300")),

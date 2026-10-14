@@ -35,6 +35,19 @@ def main() -> None:
             conn.execute(sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(sql.Identifier(schema)))
         for role in ROLES.values():
             conn.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(conn.info.dbname), sql.Identifier(role)))
+        if not conn.execute("SELECT 1 FROM pg_roles WHERE rolname='lifecycle_maintenance'").fetchone():
+            conn.execute('CREATE ROLE lifecycle_maintenance NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE')
+        if os.environ.get('MAINTENANCE_DATABASE_URL'):
+            password=unquote(urlsplit(os.environ['MAINTENANCE_DATABASE_URL']).password or '')
+            if not password:raise ValueError('Maintenance database requires a password')
+            conn.execute(sql.SQL('ALTER ROLE lifecycle_maintenance LOGIN PASSWORD {}').format(sql.Literal(password)))
+        conn.execute('GRANT USAGE ON SCHEMA execution TO lifecycle_maintenance')
+        conn.execute('GRANT SELECT ON execution.call_archives TO lifecycle_maintenance')
+        conn.execute('GRANT SELECT,INSERT,UPDATE,DELETE ON execution.retention_holds TO lifecycle_maintenance')
+        for function in ('gc_candidates()','gc_run(uuid)','gc_artifact(uuid,text,text)','gc_archive(text,uuid,text)','gc_search(uuid)'):
+            conn.execute('GRANT EXECUTE ON FUNCTION execution.'+function+' TO lifecycle_maintenance')
+        conn.execute('DROP POLICY IF EXISTS maintenance ON execution.call_archives')
+        conn.execute('CREATE POLICY maintenance ON execution.call_archives TO lifecycle_maintenance USING(true)')
         for role, schema in (("rag_runtime", "rag"), ("agent_runtime", "agent")):
             conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(schema), sql.Identifier(role)))
             conn.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} TO {}").format(sql.Identifier(schema), sql.Identifier(role)))
@@ -43,6 +56,12 @@ def main() -> None:
             conn.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA {} GRANT USAGE, SELECT ON SEQUENCES TO {}").format(sql.Identifier(schema), sql.Identifier(role)))
         conn.execute("GRANT USAGE ON SCHEMA execution TO agent_runtime, rag_runtime")
         conn.execute("GRANT SELECT, INSERT, UPDATE ON execution.tasks TO agent_runtime, rag_runtime")
+        for table in ('token_budgets','token_calls','call_archives','artifacts'):
+            conn.execute(sql.SQL('GRANT SELECT, INSERT, UPDATE ON execution.{} TO agent_runtime, rag_runtime').format(sql.Identifier(table)))
+            for role,namespace in (('agent_runtime','agent'),('rag_runtime','rag')):
+                conn.execute(sql.SQL('DROP POLICY IF EXISTS {} ON execution.{}').format(sql.Identifier(role),sql.Identifier(table)))
+                conn.execute(sql.SQL('CREATE POLICY {} ON execution.{} TO {} USING(namespace={}) WITH CHECK(namespace={})').format(
+                    sql.Identifier(role),sql.Identifier(table),sql.Identifier(role),sql.Literal(namespace),sql.Literal(namespace)))
         conn.execute('GRANT SELECT, INSERT ON execution.downstream_bindings TO agent_runtime, rag_runtime')
         for role, prefix in (('agent_runtime', 'agent:%'), ('rag_runtime', 'rag:%')):
             conn.execute(sql.SQL('DROP POLICY IF EXISTS {} ON execution.downstream_bindings').format(sql.Identifier(role)))
@@ -74,6 +93,8 @@ def main() -> None:
             conn.execute(sql.SQL("REVOKE UPDATE, DELETE ON agent.{} FROM agent_runtime").format(sql.Identifier(table)))
             conn.execute(sql.SQL("GRANT SELECT, INSERT ON agent.{} TO agent_runtime").format(sql.Identifier(table)))
         conn.execute("REVOKE DELETE ON agent.checkpoints,agent.checkpoint_blobs,agent.checkpoint_writes FROM agent_runtime")
+        conn.execute('REVOKE UPDATE, DELETE ON agent.execution_bodies,agent.body_pins,agent.verification_batches FROM agent_runtime')
+        conn.execute('GRANT SELECT, INSERT ON agent.execution_bodies,agent.body_pins,agent.verification_batches TO agent_runtime')
         conn.execute("REVOKE ALL ON execution.alembic_version, rag.alembic_version, agent.alembic_version FROM rag_runtime, agent_runtime")
 
 
