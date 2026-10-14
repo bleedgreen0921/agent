@@ -196,3 +196,17 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 默认额度正式冒烟：`.data/postgres-integration/rap-flow-smoke-28fd6844eb37/services/summary.json`。两个正式 API、两个 Worker 和本机合成模型完成文档 active、ReAct／Plan 各一个有效引用、Memory 提取及摘要；累计 30 条调用回执。runs／turns／documents／search 四种接纳能力均正常，两个 Worker 以 0 退出；API 完成应用关闭后按 SIGTERM 约定退出。服务日志无 ERROR、Traceback、resource_tracker 泄漏、未 await coroutine 或清理超期。专用容器已清理。
 
 实际冒烟补齐了正常速率等待与故障冷却的区分，以及 CPU 管理线程对命名信号量的引用回收。编译与 git diff --check 通过。告警仅记录在本地和数据库，没有外部通知发送。
+
+## C14–C17 目标、证据与工具验收
+
+2026-10-13 完成独立目标与步骤验收、证据语义检查、工具意图和显式副作用授权，以及结构化摘要和条件传播。检查使用既有调用协调器与资源，默认 16 次模型预算中保留两次用于最终生成和验收；验收不通过直接 partial，无自动修正。
+
+最终全量运行：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55475`。
+
+报告：`.data/postgres-integration/rap-test-485295843a16/summary.json`，561 通过，失败、错误、跳过均为 0，三个实验数据库专项通过。doctor 验证迁移 head 为 execution_0002、rag_personal_0001、agent_personal_0005，角色权限及任务隔离通过。真实 HTTP transport 禁用，无真实模型调用。
+
+新增测试覆盖模型说完成但独立验收失败、目标遗漏、条件丢失、来源真实但语义不支持、正文绕过结论列表、实验模拟/单位/数值/因果限制、明确授权与意图分别检查、授权次数竞争和稳定 ID、提交未知不得变成 partial、真实 checkpoint 回执，以及持久判断后的恢复不重复调用。
+
+正式入口冒烟：`.data/postgres-integration/rap-flow-smoke-1129358d91ae/services/summary.json`。默认下游限流配置下，两个 API 和两个 Worker 完成文档处理、ReAct、Plan、会话事实提取和摘要；两种 Agent 各有有效引用，生成 108 条实际图调用回执。关闭日志没有资源泄漏或异常，两次验证的专用容器均已清理。
+
+compileall 与 git diff --check 通过。仅验证了专用数据库，没有对当前个人数据库执行迁移、停止服务或部署；现有个人实例的发布步骤见 [acceptance.md](acceptance.md)。语义判断属于模型辅助检查，不承诺绝对正确。

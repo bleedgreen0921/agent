@@ -27,3 +27,5 @@ Run 的 `Idempotency-Key` 在实例内唯一；轮次必须提供该头，作用
 
 
 第三阶段：Worker 状态字段使用 `memory_consumer_alive`；时间线调用 details 增加 `checkpoint_receipts`，Run 创建事件的 details 增加 `recovery_protocol`。Agent→RAG 可传 `X-Request-Budget-Seconds` 缩短搜索期限；必须保持服务认证和 Run／调用关联头，预算头不构成执行权。业务路径和状态映射保持不变。
+
+Run 与会话轮次请求可选 `tool_authorizations`，默认为空，仅在需要副作用工具时显式指定动作、目标和次数。公开 Result 增加可选 `acceptance` 报告，历史结果为空；时间线新增 `verification` 事件，只包含安全关联和统计。见 [验收说明](../docs/acceptance.md)。

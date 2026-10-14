@@ -38,10 +38,10 @@ def recovery_contract(providers) -> dict:
             # implementation; its declared versions and schema remain compared.
             tools.append({'factory': factory, 'name': tool.name, 'schema': schema,
                           'description': tool.description, 'implementation_sha256': source_digest})
-    from agent_service.schemas import Plan, FinalDraft
+    from agent_service.schemas import Plan, FinalDraft, GoalContract, StructuredSummary, StepEvaluation, ToolBatchEvaluation, FinalEvaluation
     from contracts.v1 import Evidence
     payload = {'implementation': implementation, 'tools': tools,
-               'schemas': {s.__name__: s.model_json_schema() for s in (Plan, FinalDraft, Evidence)},
+               'schemas': {s.__name__: s.model_json_schema() for s in (Plan, FinalDraft, Evidence, GoalContract, StructuredSummary, StepEvaluation, ToolBatchEvaluation, FinalEvaluation)},
                'dependencies': {name: version(name) for name in ('langgraph', 'langchain', 'langchain-core',
                    'langgraph-checkpoint', 'langgraph-checkpoint-postgres', 'langchain-openai', 'pydantic',
                    'openai', 'httpx', 'psycopg')}}
@@ -94,6 +94,7 @@ def execution_manifest(*, providers=None) -> dict:
             "recovery_protocol": 2,
             "prompt_set_version": PROMPT_SET_VERSION,
             "tool_limits": tool_limits(),
+            "acceptance_policy": {"version":1,"failure":"partial","repair_calls":0,"final_reserved_calls":2,"side_effects":"explicit_request_grants"},
         },
         "recovery_contract": recovery_contract(providers),
         "model": {

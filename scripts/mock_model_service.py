@@ -34,7 +34,7 @@ def schema_name(body: dict) -> str | None:
     if json_schema.get("name"):
         return json_schema["name"]
     names = [item.get("function", {}).get("name") for item in body.get("tools", [])]
-    for name in ("Plan", "FinalDraft"):
+    for name in ("Plan", "FinalDraft", "FactList", "SummaryDraft", "GoalContract", "ToolBatchEvaluation", "StepEvaluation", "FinalEvaluation"):
         if name in names:
             return name
     return None
@@ -47,8 +47,17 @@ def evidence_id(body: dict) -> str | None:
 
 
 def structured_value(name: str, body: dict) -> dict:
+    if name in ('GoalContract','ToolBatchEvaluation','StepEvaluation','FinalEvaluation'):
+        # Deliberately scripted synthetic service, not a production evaluator.
+        from tests.quality_stubs import quality_value
+        payload=json.loads(body['messages'][-1]['content'])
+        return quality_value(name,payload)
+    if name == "FactList":
+        return {"facts": []}
+    if name == "SummaryDraft":
+        return {"summary": "Synthetic conversation summary; preserve original turns for factual interpretation."}
     if name == "Plan":
-        return {"steps": [{"goal": "Find the retention period in the private policy", "completion_condition": "A policy fragment states a retention period"}]}
+        return {"steps": [{"goal": "Find the retention period in the private policy", "completion_condition": "A policy fragment states a retention period", "requirement_ids":["r1"]}]}
     found = evidence_id(body)
     if found:
         return {

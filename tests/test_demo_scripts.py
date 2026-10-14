@@ -32,3 +32,12 @@ def test_synthetic_model_http_shapes():
 
         reranked = client.post("/rerank", json={"documents": ["a", "b"]}).json()["results"]
         assert [item["index"] for item in reranked] == [0, 1]
+
+
+def test_synthetic_memory_structured_shapes():
+    with TestClient(app) as client:
+        for name, key in (('FactList','facts'),('SummaryDraft','summary')):
+            response=client.post('/v1/chat/completions',json={'model':'synthetic','messages':[],
+                'response_format':{'type':'json_schema','json_schema':{'name':name}}}).json()
+            value=json.loads(response['choices'][0]['message']['content'])
+            assert key in value

@@ -52,10 +52,16 @@ class ErrorResponse(StrictModel):
     request_id: str
 
 
+class ToolAuthorization(StrictModel):
+    tool_name: str = Field(min_length=1)
+    operation: str = Field(min_length=1)
+    exact_arguments: dict[str, Any]
+    max_calls: int = Field(default=1, ge=1, le=10)
 
 class RunCreate(StrictModel):
     task: str = Field(min_length=1)
     mode: Literal["react", "plan_execute"] = "react"
+    tool_authorizations: list[ToolAuthorization] = Field(default_factory=list, max_length=10)
 
 
 RunStatus = Literal["queued", "running", "cancelling", "completed", "partial", "failed", "cancelled"]
@@ -220,14 +226,31 @@ class Claim(StrictModel):
     reason: str | None = None
 
 
+class RequirementAcceptance(StrictModel):
+    requirement_id: str
+    description: str
+    status: Literal['met','not_met','uncertain']
+    reason: str
 
+class ClaimAcceptance(StrictModel):
+    claim_id: str
+    text: str
+    status: Literal['supported','unsupported','contradicted','insufficient']
+    reason: str
 
+class AcceptanceReport(StrictModel):
+    policy_version: int
+    status: Literal['accepted','partial']
+    requirements: list[RequirementAcceptance]
+    claims: list[ClaimAcceptance]
+    issues: list[str]
 
 class Result(StrictModel):
     answer: str
     claims: list[Claim]
     citations: list[Evidence]
     notices: list[dict[str, str]]
+    acceptance: AcceptanceReport | None = None
 
 
 class RunResponse(StrictModel):
@@ -250,6 +273,7 @@ TimelineEventType = Literal[
     "tool_call",
     "result_published",
     "run_finished",
+    "verification",
 ]
 
 
