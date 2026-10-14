@@ -37,3 +37,11 @@ def timeouts_for_manifest(manifest: dict | None) -> CallTimeouts:
         positive_seconds(limits.get("model_timeout_seconds", current.model_seconds), "manifest model_timeout_seconds"),
         positive_seconds(limits.get("rag_timeout_seconds", current.rag_seconds), "manifest rag_timeout_seconds"),
     )
+
+
+from contextvars import ContextVar
+
+_run_timeouts: ContextVar[CallTimeouts | None] = ContextVar("agent_run_timeouts", default=None)
+
+def current_timeouts() -> CallTimeouts:
+    return _run_timeouts.get() or configured_timeouts()

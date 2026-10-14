@@ -68,3 +68,28 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 本轮仍有第一阶段已有的 Starlette 弃用和 Pydantic 不可变 Mapping 序列化警告，共 33 条；无新资源异常、待清理任务或连接/进程泄漏警告。成功关闭会先结束执行器和借用事务/响应，再关闭客户端/数据库池。失控线程测试在可强制结束的独立进程中执行，未挂住 pytest 主进程。
 
 本阶段未新增数据库迁移，持久执行契约版本仍为 1。同步 Worker 认领循环、ReAct/Plan、Memory、RAG 文档处理及受保护 Saver 保留第一阶段路径。发布重启两个 API，继续使用同一第一阶段个人数据库；无需重建、迁移数据或改变任务状态、预算及恢复策略。必须使用 `scripts.serve` 或由嵌入宿主自行接入资源退出 handler，才能保证失控线程下的进程退出。
+
+## 第三阶段：异步持久执行层与完整执行链
+
+2026-10-12 完成共用异步任务存储、资源注入的业务存储、协议 2 调用恢复、ProtectedSaver 原生异步适配、模型／工具／输入、Agent 两种图、Memory、文档与在线检索，以及两个 Worker 的协程调度。任务进程与 Memory 子进程已移除；资源层保留共享 CPU 池和有界 IO。
+
+正式验收命令：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55444`。
+报告目录：`.data/postgres-integration/rap-test-7b82eaa749f2/`；包含 pytest.xml、pytest.log、doctor.log、summary.json。
+
+| 检查 | 结果 |
+| --- | --- |
+| 全量合成测试 | 296 通过；0 失败、0 错误、0 跳过 |
+| 三个实验数据库专项 | 全部通过，包含两种图和并发稳定快照 |
+| 个人增量迁移 | 全新库完整迁移至 agent_personal_0002，checkpoint 初始化、授权、doctor 通过 |
+| 原资源专项 | 28 项本地资源与 8 项 PostgreSQL 边界全部继续通过 |
+| 新恢复专项 | 11 项真实数据库／SDK 专项：稳定预留、重复结算、pending write 恢复、内容损坏、写入冲突、实际事务回滚、发布核实、满额清理、停机控制通道、两类 COMMIT ACK 丢失、SDK HTTP 容量 |
+| 执行权与控制 | 三类任务的 token、停止、期限、租约、锁等待后复查与迟到合并全部通过 |
+| Worker 监督 | 协程取消隔离、数据库故障保留租约、文档重试分类、退出 watchdog 继续通过 |
+| 真实 HTTP 保护 | 全量测试禁止真实模型 transport；只允许明确作用域的精确 loopback 合成端点 |
+| 静态／编译 | 生产业务没有同步 DB、同步图调用、默认 to_thread、自建业务池或任务 Process；compileall 和 git diff --check 通过 |
+
+实际启动验证在单独的调试测试库中运行本机合成模型服务、两个正式 API 与两个异步 Worker：文档索引激活；ReAct 和 Plan 各发布一个引用；会话事实提取和摘要任务均完成；实际产生 30 条调用恢复回执；Worker 收到 SIGTERM 后以 0 退出。报告 `.data/postgres-integration/rap-test-f747c7ffec5d/async-smoke/summary.json`，服务日志同目录。API 完成 Uvicorn 正常关闭后按 SIGTERM 的退出约定结束；没有强制超期退出、错误日志或残留任务／CPU 进程。调试容器在验证后清理。
+
+本次保留原有的 33 条 Starlette 弃用和 Pydantic 不可变 Mapping 序列化提示，没有新增未 await coroutine、资源或连接泄漏提示。合成结果证明机制与集成行为，不评价实际 LLM 的科研判断能力。
+
+升级当前第二阶段个人库需停止旧执行链、备份数据库、处理残留协议 1 任务后运行增量迁移和授权；不重新初始化个人库。见 [异步执行层](async-execution.md)。本轮只修改工作区并操作隔离测试数据库，未升级正在使用的个人数据库。

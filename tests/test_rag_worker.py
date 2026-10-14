@@ -1,59 +1,52 @@
+"""Async supervision replaces document-child process polling."""
+import asyncio
+from uuid import uuid4
 import psycopg
 import pytest
-
-from rag_service import worker
-
-
-class StopPolling(Exception):
-    pass
+from execution.worker import AttemptHandle,execute,stop,settle
+from execution.contracts import TaskRef,TaskKind
+from execution.infra.types import WorkOwner,OperationDeadline
+from execution.persistence import resources
 
 
-def test_polling_database_failures_back_off_and_recover(monkeypatch):
-    outcomes = iter((
-        psycopg.OperationalError("database unavailable"),
-        psycopg.OperationalError("database unavailable"),
-        psycopg.OperationalError("database unavailable"),
-        psycopg.OperationalError("database unavailable"),
-        False,
-        StopPolling(),
-    ))
-    sleeps = []
-
-    def run_once(_presence):
-        result = next(outcomes)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    monkeypatch.setattr(worker, "run_once", run_once)
-    monkeypatch.setattr(worker, "validate_role", lambda _role: None)
-    monkeypatch.setattr(worker.Presence, "touch", lambda _self: None)
-    monkeypatch.setattr(worker, "remove", lambda *_args: None)
-    monkeypatch.setattr(worker.time, "sleep", sleeps.append)
-    monkeypatch.setattr(worker, "MAX_POLL_BACKOFF_SECONDS", 3)
-
-    with pytest.raises(StopPolling):
-        worker.main()
-
-    assert sleeps == [1, 2, 3, 3, 1]
+def handle(kind):
+    identity,token=uuid4(),uuid4()
+    return AttemptHandle(WorkOwner(TaskRef(identity,kind),token),{'id':identity,'token':token,'lease_token':token},OperationDeadline.after(2))
 
 
-def test_processing_database_failure_is_retryable(monkeypatch):
-    job = {"id": "job", "version_id": "version", "token": "token", "attempts": 1}
-    reported = []
-    monkeypatch.setattr(worker, "process", lambda claimed: (_ for _ in ()).throw(psycopg.OperationalError("database unavailable")))
-    monkeypatch.setattr(worker.os, "setsid", lambda: None)
-
-    class Outcome:
-        def put(self, value):
-            reported.append(value)
-
-    worker.child_main(job, Outcome())
-    assert reported == [("DATABASE_UNAVAILABLE", True)]
+async def test_processing_database_failure_leaves_persistent_lease_for_controller(monkeypatch):
+    from rag_service import processing
+    async def unavailable(job):raise psycopg.OperationalError('database unavailable')
+    monkeypatch.setattr(processing,'process',unavailable)
+    attempt=handle(TaskKind.DOCUMENT)
+    await execute(attempt,resources())
+    assert attempt.owner.attempt in resources().stopped_attempts
+    assert not attempt.settled
 
 
-def test_failure_recording_outage_does_not_escape_run_once(monkeypatch):
-    job = {"id": "job", "version_id": "version", "token": "token", "attempts": 1}
-    monkeypatch.setattr(worker, "fail", lambda *args: (_ for _ in ()).throw(psycopg.OperationalError("database still unavailable")))
+async def test_cancellation_stops_only_its_attempt_and_tracks_actual_work(monkeypatch):
+    from rag_service import processing
+    entered=asyncio.Event()
+    async def wait(job):entered.set();await asyncio.Event().wait()
+    monkeypatch.setattr(processing,'process',wait)
+    first,second=handle(TaskKind.DOCUMENT),handle(TaskKind.DOCUMENT)
+    first.task=asyncio.create_task(execute(first,resources()))
+    await entered.wait();entered.clear()
+    second.task=asyncio.create_task(execute(second,resources()));await entered.wait()
+    await stop(first,resources())
+    with pytest.raises(asyncio.CancelledError):await first.task
+    assert not second.task.done()
+    await stop(second,resources())
+    with pytest.raises(asyncio.CancelledError):await second.task
 
-    worker.fail_safely(job, "DATABASE_UNAVAILABLE", True)
+
+async def test_known_document_failure_uses_explicit_retry_policy(monkeypatch):
+    from rag_service import processing
+    from rag_service.storage import jobs
+    from rag_service.models import ModelFailure
+    recorded=[]
+    async def failure(job):raise ModelFailure('EMBEDDING_UNAVAILABLE',True)
+    async def record(job,code,retryable,**kwargs):recorded.append((code,retryable));return True
+    monkeypatch.setattr(processing,'process',failure);monkeypatch.setattr(jobs,'fail',record)
+    await execute(handle(TaskKind.DOCUMENT),resources())
+    assert recorded==[('EMBEDDING_UNAVAILABLE',True)]

@@ -1,193 +1,112 @@
 import hashlib
 import os
-import tempfile
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
-
 from fastapi import UploadFile
-
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode
-from db.connection import connect
-
-
-EXTENSIONS = {
-    ".pdf": "application/pdf",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".md": "text/markdown",
-    ".txt": "text/plain",
-}
-
+from execution.persistence import resources, deadline, PersistenceOutcomeUnknown
+from execution.scope import work_owner
+from execution.stores import stores
+EXTENSIONS = {'.pdf': 'application/pdf', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.md': 'text/markdown', '.txt': 'text/plain'}
 
 def files_root() -> Path:
-    root = Path(os.environ.get("RAG_FILES_DIR", ".data/rag")).resolve()
+    root = Path(os.environ.get('RAG_FILES_DIR', '.data/personal-rag')).resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
-
-def stage_file(file: UploadFile) -> tuple[Path, bytes, str]:
-    media_type = EXTENSIONS.get(Path(file.filename or "").suffix.lower())
-    if not media_type:
-        raise ApiError(422, ErrorCode.INVALID_REQUEST, "Unsupported file format")
-    limit = int(os.environ.get("RAG_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+def _write_file(file, path, limit, stopped):
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
     size = 0
-    fd, name = tempfile.mkstemp(prefix="upload-", dir=files_root())
-    path = Path(name)
+    lock=path.with_name(path.name+'.lock').open('a+b')
+    fcntl.flock(lock,fcntl.LOCK_EX)
     try:
-        with os.fdopen(fd, "wb") as output:
-            while chunk := file.file.read(1024 * 1024):
+        with path.open('xb') as output:
+            while (chunk := file.read(1024 * 1024)):
+                if stopped.is_set():
+                    raise InterruptedError('Upload stopped')
                 size += len(chunk)
                 if size > limit:
-                    raise ApiError(422, ErrorCode.INVALID_REQUEST, "File too large")
+                    raise ApiError(422, ErrorCode.INVALID_REQUEST, 'File too large')
                 digest.update(chunk)
                 output.write(chunk)
         if not size:
-            raise ApiError(422, ErrorCode.INVALID_REQUEST, "Empty file")
-        return path, digest.digest(), media_type
-    except Exception:
+            raise ApiError(422, ErrorCode.INVALID_REQUEST, 'Empty file')
+        return digest.digest()
+    except BaseException:
         path.unlink(missing_ok=True)
         raise
+    finally:
+        if stopped.is_set():
+            path.unlink(missing_ok=True)
+        lock.close()
 
+async def stage_file(file):
+    media_type = EXTENSIONS.get(Path(file.filename or '').suffix.lower())
+    if not media_type:
+        raise ApiError(422, ErrorCode.INVALID_REQUEST, 'Unsupported file format')
+    path = Path(os.environ.get('RAG_FILES_DIR', '.data/personal-rag')).absolute() / ('upload-' + uuid4().hex)
+    stopped = threading.Event()
+    from execution.artifacts import register
+    identity=await register(path)
+    try:
+        digest = await resources().io.run(_write_file, file.file, path, int(os.environ.get('RAG_MAX_UPLOAD_BYTES', str(25 * 1024 * 1024))), stopped, owner=work_owner(), deadline=deadline(120))
+        return (path, digest, media_type,identity)
+    except BaseException:
+        stopped.set()
+        if resources().accepting:
+            await resources().cleanup(resources().io.run(path.unlink, missing_ok=True, deadline=deadline(5)))
+        raise
 
 def _validate_key(key: str | None) -> None:
-    if key is not None and (not 1 <= len(key) <= 128 or any(ord(c) < 33 or ord(c) > 126 for c in key)):
-        raise ApiError(422, ErrorCode.INVALID_REQUEST, "Invalid Idempotency-Key")
+    if key is not None and (not 1 <= len(key) <= 128 or any((ord(c) < 33 or ord(c) > 126 for c in key))):
+        raise ApiError(422, ErrorCode.INVALID_REQUEST, 'Invalid Idempotency-Key')
 
-
-def _request_digest(file_digest: bytes, media_type: str, *metadata: str) -> bytes:
-    framed = [file_digest, media_type.encode()]
-    framed.extend(len(item.encode()).to_bytes(4, "big") + item.encode() for item in metadata)
-    return hashlib.sha256(b"".join(framed)).digest()
-
-
-def _lock_id(*parts: str) -> int:
-    framed = b"".join(len(part.encode()).to_bytes(4, "big") + part.encode() for part in parts)
-    return int.from_bytes(hashlib.sha256(framed).digest()[:8], "big", signed=True)
-
-
-def create_document(file: UploadFile, title: str, visibility: str, team_ids: list[UUID], key: str | None, caller_key_id: str) -> dict:
+async def _upload(file, key, *, title=None, document_id=None):
     _validate_key(key)
-    if visibility not in {"public", "restricted"} or not title.strip():
-        raise ApiError(422, ErrorCode.INVALID_REQUEST, "Invalid document metadata")
-    staged, digest, media_type = stage_file(file)
-    document_id, version_id = uuid4(), uuid4()
-    target = files_root() / f"{version_id}{Path(file.filename or '').suffix.lower()}"
-    normalized_teams = sorted({str(item) for item in team_ids})
-    request_digest = _request_digest(digest, media_type, title.strip(), visibility, *normalized_teams)
-    moved = False
-    try:
-        with connect("RAG_DATABASE_URL") as conn:
-            if key:
-                conn.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_id(caller_key_id, "create", key),))
-                existing = conn.execute("""SELECT u.request_digest,u.document_id,v.id,v.status FROM rag.upload_keys u
-                    JOIN rag.document_versions v ON v.id=u.version_id
-                    WHERE u.caller_key_id=%s AND u.scope='create' AND u.key=%s""", (caller_key_id, key)).fetchone()
-                if existing:
-                    if bytes(existing["request_digest"]) != request_digest:
-                        raise ApiError(409, ErrorCode.IDEMPOTENCY_CONFLICT, "Idempotency key conflict")
-                    return {"document_id": str(existing["document_id"]), "document_version_id": str(existing["id"]), "status": existing["status"]}
-            for team_id in team_ids:
-                if not conn.execute("SELECT 1 FROM identity.teams WHERE id=%s", (team_id,)).fetchone():
-                    raise ApiError(422, ErrorCode.INVALID_REQUEST, "Unknown team")
-            staged.replace(target)
-            moved = True
-            conn.execute("INSERT INTO rag.documents(id,title,visibility) VALUES (%s,%s,%s)", (document_id, title.strip(), visibility))
-            conn.execute("INSERT INTO rag.document_versions(id,document_id,version_number,file_sha256,file_path,media_type,status) VALUES (%s,%s,1,%s,%s,%s,'pending')", (version_id, document_id, digest, str(target), media_type))
-            for team_id in set(team_ids):
-                conn.execute("INSERT INTO rag.document_access(document_id,team_id) VALUES (%s,%s)", (document_id, team_id))
-            if key:
-                conn.execute("""INSERT INTO rag.upload_keys(caller_key_id,scope,document_id,key,request_digest,version_id)
-                    VALUES (%s,'create',%s,%s,%s,%s)""", (caller_key_id, document_id, key, request_digest, version_id))
-            conn.execute("INSERT INTO rag.processing_jobs(id,version_id,status) VALUES (%s,%s,'queued')", (uuid4(), version_id))
-    except Exception:
-        if moved:
-            target.unlink(missing_ok=True)
-        raise
-    finally:
-        staged.unlink(missing_ok=True)
-    return {"document_id": str(document_id), "document_version_id": str(version_id), "status": "pending"}
-
-
-def add_version(document_id: UUID, file: UploadFile, key: str | None, caller_key_id: str) -> dict:
-    _validate_key(key)
-    staged, digest, media_type = stage_file(file)
+    if title is not None and (not title.strip()):
+        raise ApiError(422, ErrorCode.INVALID_REQUEST, 'Invalid document metadata')
+    from execution.admission import AdmissionStore
+    from execution.upload_admission import upload_admitted
+    from contextlib import nullcontext
+    async with nullcontext() if upload_admitted.get() else AdmissionStore().request('upload', deadline(120)):
+        staged, digest, media_type,artifact_id = await stage_file(file)
     version_id = uuid4()
-    target = files_root() / f"{version_id}{Path(file.filename or '').suffix.lower()}"
-    request_digest = _request_digest(digest, media_type, str(document_id))
-    scope = "version:" + str(document_id)
-    moved = False
+    target = staged.parent / (str(version_id) + Path(file.filename or '').suffix.lower())
+    uncertain = False
+    prepared = {'document_id': document_id or uuid4(), 'version_id': version_id, 'file_path': str(target), 'digest': digest, 'media_type': media_type, 'title': title, 'key': key,'artifact_id':artifact_id}
     try:
-        with connect("RAG_DATABASE_URL") as conn:
-            doc = conn.execute("SELECT id,deleted_at FROM rag.documents WHERE id=%s FOR UPDATE", (document_id,)).fetchone()
-            if not doc or doc["deleted_at"]:
-                raise ApiError(404, ErrorCode.NOT_FOUND, "Document not found")
-            if key:
-                conn.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_id(caller_key_id, scope, key),))
-                existing = conn.execute("""SELECT u.request_digest,u.document_id,v.id,v.status FROM rag.upload_keys u
-                    JOIN rag.document_versions v ON v.id=u.version_id
-                    WHERE u.caller_key_id=%s AND u.scope=%s AND u.key=%s""", (caller_key_id, scope, key)).fetchone()
-                if existing:
-                    if existing["document_id"] != document_id or bytes(existing["request_digest"]) != request_digest:
-                        raise ApiError(409, ErrorCode.IDEMPOTENCY_CONFLICT, "Idempotency key conflict")
-                    return {"document_id": str(document_id), "document_version_id": str(existing["id"]), "status": existing["status"]}
-            pending = conn.execute("SELECT 1 FROM rag.document_versions WHERE document_id=%s AND status IN ('pending','processing')", (document_id,)).fetchone()
-            if pending:
-                raise ApiError(409, ErrorCode.VERSION_IN_PROGRESS, "Version in progress")
-            same = conn.execute("SELECT id,status FROM rag.document_versions WHERE document_id=%s AND file_sha256=%s AND media_type=%s AND status IN ('active','superseded') ORDER BY version_number DESC LIMIT 1", (document_id, digest, media_type)).fetchone()
-            if same:
-                if key:
-                    conn.execute("""INSERT INTO rag.upload_keys(caller_key_id,scope,document_id,key,request_digest,version_id)
-                        VALUES (%s,%s,%s,%s,%s,%s)""", (caller_key_id, scope, document_id, key, request_digest, same["id"]))
-                return {"document_id": str(document_id), "document_version_id": str(same["id"]), "status": same["status"]}
-            number = conn.execute("SELECT COALESCE(MAX(version_number),0)+1 AS n FROM rag.document_versions WHERE document_id=%s", (document_id,)).fetchone()["n"]
-            staged.replace(target)
-            moved = True
-            conn.execute("INSERT INTO rag.document_versions(id,document_id,version_number,file_sha256,file_path,media_type,status) VALUES (%s,%s,%s,%s,%s,%s,'pending')", (version_id, document_id, number, digest, str(target), media_type))
-            if key:
-                conn.execute("""INSERT INTO rag.upload_keys(caller_key_id,scope,document_id,key,request_digest,version_id)
-                    VALUES (%s,%s,%s,%s,%s,%s)""", (caller_key_id, scope, document_id, key, request_digest, version_id))
-            conn.execute("INSERT INTO rag.processing_jobs(id,version_id,status) VALUES (%s,%s,'queued')", (uuid4(), version_id))
-        return {"document_id": str(document_id), "document_version_id": str(version_id), "status": "pending"}
-    except Exception:
-        if moved:
-            target.unlink(missing_ok=True)
+        from execution.artifacts import prepared as prepare_artifact
+        await prepare_artifact(artifact_id,target,digest)
+        await resources().io.run(staged.replace, target, owner=work_owner(), deadline=deadline(30))
+        operation = stores()[3].create_document if document_id is None else stores()[3].add_version
+        return await operation(prepared)
+    except PersistenceOutcomeUnknown:
+        uncertain = True
+        from execution.artifacts import unknown
+        try:await unknown(artifact_id)
+        except BaseException:pass
         raise
     finally:
-        staged.unlink(missing_ok=True)
+        if not uncertain and resources().accepting:
 
+            async def cleanup():
+                if not await stores()[3].referenced(str(target)):
+                    await resources().io.run(target.unlink, missing_ok=True, deadline=deadline(5))
+                await resources().io.run(staged.unlink, missing_ok=True, deadline=deadline(5))
+            await resources().cleanup(cleanup())
 
-def version_status(document_id: UUID, version_id: UUID) -> dict:
-    with connect("RAG_DATABASE_URL") as conn:
-        row = conn.execute("""SELECT v.id,v.status,v.error_code,v.warnings,j.attempts,j.error_code AS job_error
-            FROM rag.document_versions v JOIN rag.documents d ON d.id=v.document_id
-            JOIN rag.processing_jobs j ON j.version_id=v.id
-            WHERE d.id=%s AND v.id=%s""", (document_id, version_id)).fetchone()
-    if not row:
-        raise ApiError(404, ErrorCode.NOT_FOUND, "Version not found")
-    return {"document_id": str(document_id), "document_version_id": str(version_id), "status": row["status"], "attempts": row["attempts"], "error_code": row["error_code"] or row["job_error"], "warnings": row["warnings"]}
+async def create_document(file, title, key):
+    return await _upload(file, key, title=title)
 
+async def add_version(document_id, file, key):
+    return await _upload(file, key, document_id=document_id)
 
-def set_access(document_id: UUID, visibility: str, team_ids: list[UUID]) -> dict:
-    if visibility not in {"public", "restricted"}:
-        raise ApiError(422, ErrorCode.INVALID_REQUEST, "Invalid visibility")
-    with connect("RAG_DATABASE_URL") as conn:
-        doc = conn.execute("SELECT id FROM rag.documents WHERE id=%s AND deleted_at IS NULL FOR UPDATE", (document_id,)).fetchone()
-        if not doc:
-            raise ApiError(404, ErrorCode.NOT_FOUND, "Document not found")
-        for team_id in team_ids:
-            if not conn.execute("SELECT 1 FROM identity.teams WHERE id=%s", (team_id,)).fetchone():
-                raise ApiError(422, ErrorCode.INVALID_REQUEST, "Unknown team")
-        conn.execute("UPDATE rag.documents SET visibility=%s WHERE id=%s", (visibility, document_id))
-        conn.execute("DELETE FROM rag.document_access WHERE document_id=%s", (document_id,))
-        for team_id in set(team_ids):
-            conn.execute("INSERT INTO rag.document_access(document_id,team_id) VALUES (%s,%s)", (document_id, team_id))
-    return {"document_id": str(document_id), "visibility": visibility, "team_ids": [str(x) for x in team_ids]}
+async def version_status(document_id, version_id):
+    return await stores()[3].version_status(document_id, version_id)
 
-
-def soft_delete(document_id: UUID) -> dict:
-    with connect("RAG_DATABASE_URL") as conn:
-        row = conn.execute("UPDATE rag.documents SET deleted_at=COALESCE(deleted_at,now()) WHERE id=%s RETURNING id,deleted_at", (document_id,)).fetchone()
-    if not row:
-        raise ApiError(404, ErrorCode.NOT_FOUND, "Document not found")
-    return {"document_id": str(document_id), "deleted_at": row["deleted_at"]}
+async def soft_delete(document_id):
+    return await stores()[3].soft_delete(document_id)

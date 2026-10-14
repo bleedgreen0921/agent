@@ -24,3 +24,6 @@ Run 的 `Idempotency-Key` 在实例内唯一；轮次必须提供该头，作用
 证据接口要求 `Authorization: Bearer RAG_SERVICE_TOKEN`、`X-Run-Id`、`X-Tool-Call-Id`。它们关联持久调用与检索审计。错误 Token 返回 401，缺少关联头返回 422。
 
 业务状态映射见 [执行契约](../docs/execution-contract.md)。Run 取消竞争遵循已完成终态、旧 token 拒绝、已提交取消、总期限、普通失败的顺序。
+
+
+第三阶段：Worker 状态字段使用 `memory_consumer_alive`；时间线调用 details 增加 `checkpoint_receipts`，Run 创建事件的 details 增加 `recovery_protocol`。Agent→RAG 可传 `X-Request-Budget-Seconds` 缩短搜索期限；必须保持服务认证和 Run／调用关联头，预算头不构成执行权。业务路径和状态映射保持不变。

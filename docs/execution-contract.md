@@ -22,3 +22,8 @@ Initialization order: execution → rag → agent, then owner-created checkpoint
 异步基础设施定义于 `execution/infra/`，完整接口、配置和关闭约束见 [异步资源说明](async-resources.md)。`WorkRegistry` 保留同步 Worker 的 register/release/occupied 接口，并使用线程锁登记队列、物理 Future、逻辑停止与 generation。逻辑取消不释放正在运行的物理容量，结果停止与完成回调竞争只能完成/释放一次。
 
 `RuntimeResources` 只管理进程内工作和资源，不代替此文定义的数据库执行权、预算、checkpoint 保护或持久结算。执行契约版本保持 1；`WorkOwner`、`OperationDeadline`、`WorkRecord` 仅是基础设施本地类型。CPU 整池中断明确交付 `CpuPoolReset`；后续业务迁移必须自行按持久策略结算，不得由资源层自动重试。
+
+
+## 第三阶段持久执行协议
+
+当前执行路径已全部异步化并移除每任务进程。基础 Task／ToolOutcome 契约仍为 1；新增 Agent 恢复协议 2，以实际图记录和同事务回执保护恢复，取代批量 checkpointed 确认。完整接口、期限、取消、未知提交和增量升级说明见 [异步执行层](async-execution.md)。

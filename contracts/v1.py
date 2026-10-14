@@ -90,7 +90,7 @@ class WorkerInstanceStatus(StrictModel):
     started_at: datetime
     heartbeat_at: datetime
     online: bool
-    memory_child_alive: bool | None = None
+    memory_consumer_alive: bool | None = None
 
 
 class WorkerSnapshot(StrictModel):
