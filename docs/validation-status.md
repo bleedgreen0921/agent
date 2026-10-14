@@ -178,3 +178,21 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 结果：468 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor、数据库角色权限、三条迁移链和三个实验数据库专项通过；专用容器已清理，未操作个人数据库。相关模块编译与 git diff --check 通过。
 
 本轮新增 `agent_personal_0003` 增量迁移，仅扩展 Manifest schema 约束；个人数据库仍需在停止旧 API／Worker并备份后执行 migrate、bootstrap 和 doctor。旧 Manifest／checkpoint 不转换、不伪造回执，已有历史结果保留。部署规则和实现边界见 [恢复与事务说明](recovery-and-transactions.md)。
+
+
+## C05、C07–C10：工具隔离、压力、接纳、公平与进展
+
+2026-10-13 完成工具状态／参数隔离、确定性合并、Run／Worker 工具名额及批次限制；数据库共享令牌桶、429 分类、冷却、单次探测与速率恢复；三类任务和在线搜索接纳、会话 Memory 预留、multipart 前上传接纳；数据库交替认领；可信阶段记录、等待原因、无进展中断与去重告警。SDK 自动重试保持关闭，提交未知不发送请求，物理工作继续占据实际名额。
+
+新增 55 项真实 PostgreSQL／受控 HTTP 专项，涵盖跨进程共享配额、并发容量竞争、幂等重放、Memory 名额转换与回滚、冷却头和迟到 429、单次探测、提交未知、SDK 429、搜索取消、公平游标回滚、工具私有状态与图顺序、线程取消后容量、工具等待者取消、调用归属、进展优先级／重复事件、实际 CPU 超时终结、上传拒收前不读取 body、角色隔离、配置保留冷却、正常配额等待不错误降级、CPU 命名信号量回收、排队原因说明及 CPU_POOL_RESET 公共响应。
+
+全量验收：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55467`。
+报告：`.data/postgres-integration/rap-test-756d066e2b70/`。
+结果：523 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor、数据库角色隔离及三个实验数据库专项通过。专用容器已清理，没有访问真实模型或个人数据库。
+
+新增 migration head 为 execution_0002、agent_personal_0004；RAG 仍为 rag_personal_0001。新图 v3，Manifest schema 4，协议 2。个人数据库尚未升级；发布需要停止旧 API／Worker、备份、migrate、bootstrap、flow_control --configure 和 doctor。规则见 [流量与进展控制](flow-control.md)。
+
+
+默认额度正式冒烟：`.data/postgres-integration/rap-flow-smoke-28fd6844eb37/services/summary.json`。两个正式 API、两个 Worker 和本机合成模型完成文档 active、ReAct／Plan 各一个有效引用、Memory 提取及摘要；累计 30 条调用回执。runs／turns／documents／search 四种接纳能力均正常，两个 Worker 以 0 退出；API 完成应用关闭后按 SIGTERM 约定退出。服务日志无 ERROR、Traceback、resource_tracker 泄漏、未 await coroutine 或清理超期。专用容器已清理。
+
+实际冒烟补齐了正常速率等待与故障冷却的区分，以及 CPU 管理线程对命名信号量的引用回收。编译与 git diff --check 通过。告警仅记录在本地和数据库，没有外部通知发送。

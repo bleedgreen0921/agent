@@ -82,6 +82,7 @@ def application_revision() -> dict:
 
 
 def execution_manifest(*, providers=None) -> dict:
+    from execution.flow_config import tool_limits
     from agent_service.tooling import load_providers
     timeouts = configured_timeouts()
     model_url = os.environ.get("AGENT_MODEL_URL", "")
@@ -92,6 +93,7 @@ def execution_manifest(*, providers=None) -> dict:
             "graph_version": GRAPH_VERSION,
             "recovery_protocol": 2,
             "prompt_set_version": PROMPT_SET_VERSION,
+            "tool_limits": tool_limits(),
         },
         "recovery_contract": recovery_contract(providers),
         "model": {

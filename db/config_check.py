@@ -65,6 +65,9 @@ def positive_int(name: str, default: int) -> int:
 def validate_role(role: str) -> None:
     if role not in ROLES:
         raise ValueError("Unknown process role")
+    if role.endswith("-api"):
+        from execution.infra.types import ResourceConfig
+        ResourceConfig.from_env()
     positive_int("DB_CONNECT_TIMEOUT_SECONDS", 10)
     for statement_name, statement_default, lock_name, lock_default in TIMEOUT_PROFILES.values():
         for name, default in ((statement_name, statement_default), (lock_name, lock_default)):
@@ -93,17 +96,19 @@ def validate_role(role: str) -> None:
             raise ValueError("AGENT_HEARTBEAT_SECONDS must be no greater than one third of AGENT_LEASE_SECONDS")
         positive_int("AGENT_EXECUTION_TIMEOUT_SECONDS", 300)
         seconds("AGENT_CONTROL_POLL_SECONDS", 0.5)
-        seconds("AGENT_TERMINATE_GRACE_SECONDS", 3)
+        seconds("EXECUTOR_CLEANUP_GRACE_SECONDS", 5)
+        seconds("WORKER_EXIT_GRACE_SECONDS", 30)
         seconds("AGENT_MODEL_TIMEOUT_SECONDS", 120)
         seconds("AGENT_RAG_TIMEOUT_SECONDS", 120)
+        positive_int("AGENT_MEMORY_TIMEOUT_SECONDS", 900)
         seconds("AGENT_MEMORY_POLL_SECONDS", 1)
         seconds("AGENT_MEMORY_EMBED_TIMEOUT_SECONDS", 15)
         url("AGENT_EMBEDDING_URL", optional=True)
         url("RAG_EMBEDDING_URL", optional=True)
     elif role == "rag-api":
-        database("IDENTITY_ADMIN_DATABASE_URL")
         if len(required("RAG_SERVICE_TOKEN")) < 43:
             raise ValueError("RAG_SERVICE_TOKEN must contain at least 43 characters")
+        seconds("RAG_SEARCH_TIMEOUT_SECONDS",120)
         positive_int("RAG_MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
         seconds("RAG_MODEL_TIMEOUT_SECONDS", 30)
         url("RAG_REWRITE_URL", optional=True)
@@ -111,8 +116,11 @@ def validate_role(role: str) -> None:
     elif role == "rag-worker":
         url("RAG_EMBEDDING_URL")
         seconds("RAG_MODEL_TIMEOUT_SECONDS", 30)
+        positive_int("RAG_MAX_CONCURRENT_DOCUMENTS",1)
         positive_int("RAG_MAX_CHUNKS", 2000)
         positive_int("RAG_DOCUMENT_TIMEOUT_SECONDS", 14400)
+    from execution.flow_config import validate
+    validate(role)
 
 
 def main(argv: list[str] | None = None) -> int:

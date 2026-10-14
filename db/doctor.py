@@ -22,13 +22,11 @@ REQUIRED_ENV = (
     "MIGRATION_DATABASE_URL",
     "RAG_DATABASE_URL",
     "AGENT_DATABASE_URL",
-    "IDENTITY_ADMIN_DATABASE_URL",
 )
 ENV_LABELS = {
     "MIGRATION_DATABASE_URL": "owner",
     "RAG_DATABASE_URL": "rag_runtime",
     "AGENT_DATABASE_URL": "agent_runtime",
-    "IDENTITY_ADMIN_DATABASE_URL": "identity_admin",
 }
 SAMPLE_LIMIT = 20
 
@@ -81,7 +79,7 @@ def check_connectivity() -> dict:
 
 def _migration_heads() -> dict[str, str]:
     heads = {}
-    locations = {"identity": "identity", "rag": "rag_service", "agent": "agent_service"}
+    locations = {"execution": "execution", "rag": "rag_service", "agent": "agent_service"}
     for schema, package in locations.items():
         config = Config()
         config.set_main_option("script_location", str(ROOT / package / "migrations"))
@@ -134,8 +132,8 @@ def check_checkpoints() -> dict:
 
 
 def check_role_permissions() -> dict:
-    roles = ("rag_runtime", "agent_runtime", "identity_admin")
-    schemas = ("identity", "rag", "agent")
+    roles = ("rag_runtime", "agent_runtime")
+    schemas = ("execution", "rag", "agent")
     privileges = ("SELECT", "INSERT", "UPDATE", "DELETE")
     violations: list[dict] = []
     with readonly_connection("MIGRATION_DATABASE_URL") as conn:
@@ -144,6 +142,9 @@ def check_role_permissions() -> dict:
             if role not in existing_roles:
                 violations.append({"role": role, "object": "role", "issue": "missing"})
                 continue
+            attributes = conn.execute('SELECT rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication FROM pg_roles WHERE rolname=%s', (role,)).fetchone()
+            if any(attributes.values()):
+                violations.append({'role':role,'object':'role','issue':'elevated runtime privileges'})
             database_access = conn.execute("SELECT has_database_privilege(%s,current_database(),'CONNECT') AS allowed", (role,)).fetchone()["allowed"]
             if not database_access:
                 violations.append({"role": role, "object": "database", "privilege": "CONNECT", "expected": True, "actual": False})
@@ -151,7 +152,7 @@ def check_role_permissions() -> dict:
             if public_usage != (role in {"rag_runtime", "agent_runtime"}):
                 violations.append({"role": role, "object": "public", "privilege": "USAGE", "expected": role in {"rag_runtime", "agent_runtime"}, "actual": public_usage})
             for schema in schemas:
-                expected_usage = schema == {"rag_runtime": "rag", "agent_runtime": "agent", "identity_admin": "identity"}[role] or (schema == "identity" and role in {"rag_runtime", "agent_runtime"})
+                expected_usage = schema in {"execution", {"rag_runtime":"rag", "agent_runtime":"agent"}[role]}
                 actual_usage = conn.execute("SELECT has_schema_privilege(%s,%s,'USAGE') AS allowed", (role, schema)).fetchone()["allowed"]
                 if actual_usage != expected_usage:
                     violations.append({"role": role, "object": schema, "privilege": "USAGE", "expected": expected_usage, "actual": actual_usage})
@@ -168,11 +169,17 @@ def check_role_permissions() -> dict:
                 elif role == "rag_runtime" and schema == "rag":
                     expected = set(privileges)
                 elif role == "agent_runtime" and schema == "agent":
-                    expected = {"SELECT", "INSERT"} if name in {"run_manifests", "conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots", "run_experiment_snapshots"} else set(privileges)
-                elif role == "identity_admin" and schema == "identity":
+                    expected = {"SELECT", "INSERT"} if name in {"verification_batches", "execution_bodies", "body_pins", "run_goal_contracts", "run_tool_authorizations", "tool_authorization_uses", "run_verifications", "call_checkpoint_receipts", "run_results", "result_claims", "evidence_snapshots", "claim_evidence", "run_manifests", "conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots", "run_experiment_snapshots"} else ({'SELECT','INSERT','UPDATE'} if name in {'checkpoints','checkpoint_blobs','checkpoint_writes'} else set(privileges))
+                elif schema == 'execution' and name == 'tasks':
+                    expected = {'SELECT','INSERT','UPDATE'}
+                elif schema == 'execution' and name == 'downstream_bindings':
+                    expected = {'SELECT','INSERT'}
+                elif schema == 'execution' and name in {'token_budgets','token_calls','call_archives','artifacts','flow_buckets','claim_cursors','task_activities','flow_alerts'}:
+                    expected = {'SELECT','INSERT','UPDATE'}
+                elif schema == 'execution' and name in {'request_permits','worker_resources'}:
                     expected = set(privileges)
-                elif role in {"rag_runtime", "agent_runtime"} and schema == "identity" and name in {"teams", "credentials", "users"}:
-                    expected = {"SELECT"}
+                elif schema == 'execution' and name == 'capacity_reservations' and role == 'agent_runtime':
+                    expected = set(privileges)
                 else:
                     expected = set()
                 for privilege in privileges:
@@ -182,6 +189,24 @@ def check_role_permissions() -> dict:
     if violations:
         return result("db.role_permissions", "error", "Database role permissions do not match the isolation matrix", {"count": len(violations), "samples": violations[:SAMPLE_LIMIT]})
     return result("db.role_permissions", "pass", "Database role permissions match the isolation matrix")
+
+
+def check_personal_model() -> dict:
+    with readonly_connection('MIGRATION_DATABASE_URL') as conn:
+        old = conn.execute("""SELECT table_schema,table_name,column_name FROM information_schema.columns
+            WHERE table_schema='identity' OR (table_schema IN ('agent','rag','execution')
+            AND column_name IN ('team_id','user_id','key_id','caller_key_id','visibility'))""").fetchall()
+        policies = conn.execute("SELECT policyname,roles,qual,with_check FROM pg_policies WHERE schemaname='execution' AND tablename='tasks'").fetchall()
+        rls = conn.execute("SELECT relrowsecurity FROM pg_class WHERE oid='execution.tasks'::regclass").fetchone()['relrowsecurity']
+    if old or not rls or {p['policyname'] for p in policies} != {'agent_runtime','rag_runtime'}:
+        return result('db.personal_model','error','Personal schema or task isolation is invalid')
+    expected = {'agent_runtime': {'agent_run','memory_job'}, 'rag_runtime': {'rag_document'}}
+    for policy in policies:
+        terms = {kind for kind in ('agent_run','memory_job','rag_document') if kind in policy['qual']}
+        checks = {kind for kind in ('agent_run','memory_job','rag_document') if kind in policy['with_check']}
+        if terms != expected[policy['policyname']] or checks != terms or policy['roles'] != [policy['policyname']]:
+            return result('db.personal_model','error','Task policies do not match the service type boundary')
+    return result('db.personal_model','pass','Personal schema and execution RLS are present')
 
 
 def check_active_revision() -> dict:
@@ -215,8 +240,9 @@ def check_embedding_coverage() -> dict:
 
 def check_processing_leases() -> dict:
     with readonly_connection("RAG_DATABASE_URL") as conn:
-        total = conn.execute("SELECT count(*) AS n FROM rag.processing_jobs WHERE status='running' AND (leased_until IS NULL OR leased_until<=now())").fetchone()["n"]
-        rows = conn.execute("SELECT id FROM rag.processing_jobs WHERE status='running' AND (leased_until IS NULL OR leased_until<=now()) ORDER BY id LIMIT %s", (SAMPLE_LIMIT,)).fetchall()
+        observed = conn.execute('SELECT clock_timestamp() AS at').fetchone()['at']
+        total = conn.execute("SELECT count(*) AS n FROM rag.processing_job_state WHERE status='running' AND (leased_until IS NULL OR leased_until<=%s)", (observed,)).fetchone()["n"]
+        rows = conn.execute("SELECT id FROM rag.processing_job_state WHERE status='running' AND (leased_until IS NULL OR leased_until<=%s) ORDER BY id LIMIT %s", (observed, SAMPLE_LIMIT)).fetchall()
     if total:
         return result("rag.processing_leases", "warn", "Processing jobs have expired running leases", {"count": total, "samples": [str(row["id"]) for row in rows]})
     return result("rag.processing_leases", "pass", "No processing jobs have expired running leases")
@@ -224,8 +250,9 @@ def check_processing_leases() -> dict:
 
 def check_run_leases() -> dict:
     with readonly_connection("AGENT_DATABASE_URL") as conn:
-        total = conn.execute("SELECT count(*) AS n FROM agent.agent_runs WHERE status IN ('running','cancelling') AND (leased_until IS NULL OR leased_until<=now())").fetchone()["n"]
-        rows = conn.execute("SELECT id FROM agent.agent_runs WHERE status IN ('running','cancelling') AND (leased_until IS NULL OR leased_until<=now()) ORDER BY id LIMIT %s", (SAMPLE_LIMIT,)).fetchall()
+        observed = conn.execute('SELECT clock_timestamp() AS at').fetchone()['at']
+        total = conn.execute("SELECT count(*) AS n FROM agent.run_state WHERE status IN ('running','cancelling') AND (leased_until IS NULL OR leased_until<=%s)", (observed,)).fetchone()["n"]
+        rows = conn.execute("SELECT id FROM agent.run_state WHERE status IN ('running','cancelling') AND (leased_until IS NULL OR leased_until<=%s) ORDER BY id LIMIT %s", (observed, SAMPLE_LIMIT)).fetchall()
     if total:
         return result("agent.run_leases", "warn", "Agent Runs have expired active leases", {"count": total, "samples": [str(row["id"]) for row in rows]})
     return result("agent.run_leases", "pass", "No active Agent Runs have expired leases")
@@ -233,13 +260,14 @@ def check_run_leases() -> dict:
 
 def check_memory_jobs() -> dict:
     with readonly_connection("AGENT_DATABASE_URL") as conn:
-        rows = conn.execute("""SELECT id FROM agent.memory_jobs WHERE status='running' AND (leased_until IS NULL OR leased_until<=now())
-            ORDER BY id LIMIT %s""", (SAMPLE_LIMIT,)).fetchall()
-        failed = conn.execute("SELECT count(*) AS n FROM agent.memory_jobs WHERE status='failed'").fetchone()["n"]
+        observed = conn.execute('SELECT clock_timestamp() AS at').fetchone()['at']
+        rows = conn.execute("""SELECT id FROM agent.memory_job_state WHERE status='running' AND (leased_until IS NULL OR leased_until<=%s)
+            ORDER BY id LIMIT %s""", (observed, SAMPLE_LIMIT)).fetchall()
+        failed = conn.execute("SELECT count(*) AS n FROM agent.memory_job_state WHERE status='failed'").fetchone()["n"]
     if rows or failed:
-        return result("agent.memory_jobs", "warn", "Memory jobs have expired leases or exhausted retries",
+        return result("agent.memory_job_state", "warn", "Memory jobs have expired leases or exhausted retries",
                       {"expired_samples": [str(r["id"]) for r in rows], "failed_count": failed})
-    return result("agent.memory_jobs", "pass", "Memory jobs have no expired leases or exhausted retries")
+    return result("agent.memory_job_state", "pass", "Memory jobs have no expired leases or exhausted retries")
 
 
 def check_worker_status(service: str) -> dict:
@@ -253,16 +281,15 @@ def check_worker_status(service: str) -> dict:
 
 def check_call_consistency() -> dict:
     with readonly_connection("AGENT_DATABASE_URL") as conn:
-        terminal = conn.execute("""SELECT DISTINCT r.id FROM agent.agent_runs r
+        terminal = conn.execute("""SELECT DISTINCT r.id FROM agent.run_state r
             WHERE r.status IN ('completed','partial','failed','cancelled') AND (
               EXISTS (SELECT 1 FROM agent.model_calls m WHERE m.run_id=r.id AND m.status='started') OR
               EXISTS (SELECT 1 FROM agent.tool_calls t WHERE t.run_id=r.id AND t.status='started'))
             ORDER BY r.id""").fetchall()
-        unsafe = conn.execute("""SELECT DISTINCT r.id FROM agent.agent_runs r
-            WHERE r.status IN ('running','cancelling') AND (r.leased_until IS NULL OR r.leased_until<=now()) AND (
-              EXISTS (SELECT 1 FROM agent.model_calls m WHERE m.run_id=r.id AND (m.status='started' OR NOT m.checkpointed)) OR
-              EXISTS (SELECT 1 FROM agent.tool_calls t WHERE t.run_id=r.id AND (t.status='started' OR NOT t.checkpointed)))
-            ORDER BY r.id""").fetchall()
+        from agent_service.storage.receipts import resumable_offline
+        observed = conn.execute('SELECT clock_timestamp() AS at').fetchone()['at']
+        expired=conn.execute("SELECT id FROM agent.run_state WHERE status IN ('running','cancelling') AND (leased_until IS NULL OR leased_until<=%s) ORDER BY id", (observed,)).fetchall()
+        unsafe=[row for row in expired if not resumable_offline(conn,row['id'])]
     if terminal:
         return result("agent.call_consistency", "error", "Terminal Runs still contain started calls", {
             "terminal_started_count": len(terminal),
@@ -276,7 +303,7 @@ def check_call_consistency() -> dict:
 
 
 def check_files_consistency() -> dict:
-    root = Path(os.environ.get("RAG_FILES_DIR", ".data/rag")).resolve()
+    root = Path(os.environ.get("RAG_FILES_DIR", ".data/personal-rag")).resolve()
     with readonly_connection("RAG_DATABASE_URL") as conn:
         rows = conn.execute("SELECT id,file_path FROM rag.document_versions ORDER BY id").fetchall()
     referenced = {Path(row["file_path"]).resolve(): str(row["id"]) for row in rows}
@@ -302,6 +329,17 @@ def check_files_consistency() -> dict:
     return result("rag.files_consistency", "pass", message, {"referenced_count": len(referenced)})
 
 
+def check_flow_control():
+    from db.flow_control import snapshot
+    with readonly_connection('MIGRATION_DATABASE_URL') as conn:
+        state = snapshot(conn)
+    live_alerts = [a for a in state['alerts'] if a['resolved_at'] is None]
+    if live_alerts or state['expired_activities']:
+        return result('execution.flow_control','warn','Flow pressure or overdue phases require attention',
+                      {'active_alerts': live_alerts, 'expired_activities': state['expired_activities']})
+    return result('execution.flow_control','pass','No active flow alerts or overdue phases')
+
+
 def run_checks() -> dict:
     checks = [
         check_required_env(),
@@ -310,13 +348,15 @@ def run_checks() -> dict:
         _safe_check("db.pgvector", check_pgvector),
         _safe_check("agent.checkpoints", check_checkpoints),
         _safe_check("db.role_permissions", check_role_permissions),
+        _safe_check("db.personal_model", check_personal_model),
         _safe_check("rag.active_revision", check_active_revision),
         _safe_check("rag.embedding_coverage", check_embedding_coverage),
         _safe_check("rag.processing_leases", check_processing_leases),
         _safe_check("agent.run_leases", check_run_leases),
-        _safe_check("agent.memory_jobs", check_memory_jobs),
+        _safe_check("agent.memory_job_state", check_memory_jobs),
         _safe_check("agent.worker_status", lambda: check_worker_status("agent")),
         _safe_check("rag.worker_status", lambda: check_worker_status("rag")),
+        _safe_check("execution.flow_control", check_flow_control),
         _safe_check("agent.call_consistency", check_call_consistency),
         _safe_check("rag.files_consistency", check_files_consistency),
     ]

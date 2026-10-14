@@ -14,10 +14,11 @@ log = logging.getLogger(__name__)
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: ErrorCode, message: str):
+    def __init__(self, status: int, code: ErrorCode, message: str, *, headers=None):
         self.status = status
         self.code = code
         self.message = message
+        self.headers = headers
 
 
 def _error_response(
@@ -40,7 +41,7 @@ def _error_response(
 def install_errors(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def api_error(request: Request, exc: ApiError):
-        return _error_response(request, exc.status, exc.code, exc.message)
+        return _error_response(request, exc.status, exc.code, exc.message, headers=exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):

@@ -1,6 +1,6 @@
 """Explicit versions for persisted Agent execution behavior."""
 
-GRAPH_VERSION = "v2"
+GRAPH_VERSION = "v3"
 PROMPT_SET_VERSION = "v2"
 MANIFEST_SCHEMA_VERSION = 4
 STATE_SCHEMA_VERSION = "v1"

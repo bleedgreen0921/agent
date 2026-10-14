@@ -11,6 +11,14 @@ class StrictModel(BaseModel):
 
 
 class ErrorCode(StrEnum):
+    SUBMISSION_RATE_LIMITED = "SUBMISSION_RATE_LIMITED"
+    QUEUE_CAPACITY_EXCEEDED = "QUEUE_CAPACITY_EXCEEDED"
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+    MODEL_RATE_LIMITED = "MODEL_RATE_LIMITED"
+    RAG_RATE_LIMITED = "RAG_RATE_LIMITED"
+    TOOL_BATCH_TOO_LARGE = "TOOL_BATCH_TOO_LARGE"
+    TOOL_CAPACITY_EXCEEDED = "TOOL_CAPACITY_EXCEEDED"
+    EXECUTION_STALLED = "EXECUTION_STALLED"
     CPU_POOL_RESET = "CPU_POOL_RESET"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     UNAUTHENTICATED = "UNAUTHENTICATED"
@@ -83,8 +91,21 @@ class RunQueueSummary(StrictModel):
     oldest_claimable_created_at: datetime | None
 
 
+class PhaseProgress(StrictModel):
+    waiting_reason: str | None = None
+    stage: str
+    started_at: datetime
+    deadline_at: datetime
 
 
+class ExecutionProgress(StrictModel):
+    last_progress_at: datetime | None
+    sequence: int
+    observed_at: datetime
+    activities: list[PhaseProgress]
+    draining: bool | None = None
+    draining_observed_at: datetime | None = None
+    waiting_reason: str | None = None
 
 
 class WorkerInstanceStatus(StrictModel):
@@ -93,6 +114,7 @@ class WorkerInstanceStatus(StrictModel):
     heartbeat_at: datetime
     online: bool
     memory_consumer_alive: bool | None = None
+    resources: dict[str, Any] | None = None
 
 
 class WorkerSnapshot(StrictModel):
@@ -105,6 +127,10 @@ class WorkerSnapshot(StrictModel):
     overdue_count: int
     expired_lease_count: int
     instances: list[WorkerInstanceStatus]
+    work_classes: list[dict[str, Any]] = Field(default_factory=list)
+    downstream: list[dict[str, Any]] = Field(default_factory=list)
+    alerts: list[dict[str, Any]] = Field(default_factory=list)
+    admission: dict[str, Any] | None = None
 
 
 class SourceLocator(StrictModel):
@@ -176,6 +202,7 @@ class DocumentVersionRef(StrictModel):
 
 
 class DocumentVersionStatus(DocumentVersionRef):
+    progress: ExecutionProgress | None = None
     attempts: int = Field(ge=0)
     error_code: str | None
     warnings: list[str]
@@ -204,6 +231,7 @@ class Result(StrictModel):
 
 
 class RunResponse(StrictModel):
+    progress: ExecutionProgress | None = None
     run_id: str
     mode: Literal["react", "plan_execute"]
     status: RunStatus

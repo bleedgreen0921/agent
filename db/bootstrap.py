@@ -43,6 +43,24 @@ def main() -> None:
             conn.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA {} GRANT USAGE, SELECT ON SEQUENCES TO {}").format(sql.Identifier(schema), sql.Identifier(role)))
         conn.execute("GRANT USAGE ON SCHEMA execution TO agent_runtime, rag_runtime")
         conn.execute("GRANT SELECT, INSERT, UPDATE ON execution.tasks TO agent_runtime, rag_runtime")
+        conn.execute('GRANT SELECT, INSERT ON execution.downstream_bindings TO agent_runtime, rag_runtime')
+        for role, prefix in (('agent_runtime', 'agent:%'), ('rag_runtime', 'rag:%')):
+            conn.execute(sql.SQL('DROP POLICY IF EXISTS {} ON execution.downstream_bindings').format(sql.Identifier(role)))
+            conn.execute(sql.SQL('CREATE POLICY {} ON execution.downstream_bindings TO {} USING (service LIKE {}) WITH CHECK (service LIKE {})').format(sql.Identifier(role), sql.Identifier(role), sql.Literal(prefix), sql.Literal(prefix)))
+        for table in ('worker_resources', 'flow_buckets', 'claim_cursors', 'capacity_reservations', 'request_permits', 'task_activities', 'flow_alerts'):
+            roles = 'agent_runtime' if table == 'capacity_reservations' else 'agent_runtime, rag_runtime'
+            conn.execute(sql.SQL('REVOKE ALL ON execution.{} FROM agent_runtime, rag_runtime').format(sql.Identifier(table)))
+            privileges = 'SELECT, INSERT, UPDATE, DELETE' if table in ('worker_resources','capacity_reservations','request_permits') else 'SELECT, INSERT, UPDATE'
+            conn.execute(sql.SQL('GRANT ' + privileges + ' ON execution.{} TO ' + roles).format(sql.Identifier(table)))
+            for role, kinds, scopes in (
+                ('agent_runtime', "kind IN ('agent_run','memory_job')", "scope IN ('downstream','agent_run','memory_job')"),
+                ('rag_runtime', "kind='rag_document'", "scope IN ('downstream','rag_document','search','upload')")):
+                predicate = (kinds if table in ('worker_resources','claim_cursors','task_activities') else
+                    'true' if table == 'capacity_reservations' and role == 'agent_runtime' else
+                    'false' if table == 'capacity_reservations' else scopes)
+                conn.execute(sql.SQL('DROP POLICY IF EXISTS {} ON execution.{}').format(sql.Identifier(role), sql.Identifier(table)))
+                conn.execute(sql.SQL('CREATE POLICY {} ON execution.{} TO {} USING ({}) WITH CHECK ({})').format(
+                    sql.Identifier(role), sql.Identifier(table), sql.Identifier(role), sql.SQL(predicate), sql.SQL(predicate)))
         for role, predicate in (("agent_runtime", "kind IN ('agent_run','memory_job')"),
                                 ("rag_runtime", "kind='rag_document'")):
             conn.execute(sql.SQL("DROP POLICY IF EXISTS {} ON execution.tasks").format(sql.Identifier(role)))
