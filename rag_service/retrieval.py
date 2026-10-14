@@ -1,233 +1,156 @@
+from rag_service.storage import retrieval as retrieval_store
+from rag_service.storage.retrieval import _audit,_evidence,read_evidence
 import hashlib
 from uuid import UUID, uuid4
-
-import psycopg
-from psycopg.types.json import Jsonb
-
 from contracts.errors import ApiError
 from contracts.v1 import ErrorCode, EvidenceSearchRequest
-from db.connection import connect
 from rag_service.models import ModelFailure, embed, rerank, rewrite
-from rag_service.worker import sparse_terms, vector_literal
-
-
-VISIBLE = """d.deleted_at IS NULL AND d.active_version_id=c.version_id
-    AND (d.visibility='public' OR EXISTS (
-      SELECT 1 FROM rag.document_access a WHERE a.document_id=d.id AND a.team_id=%s))"""
-VISIBLE_HISTORY = """d.deleted_at IS NULL AND (d.visibility='public' OR EXISTS (
-      SELECT 1 FROM rag.document_access a WHERE a.document_id=d.id AND a.team_id=%s))"""
-
-
-def _revision(conn) -> dict:
-    row = conn.execute("""SELECT r.id,r.model,r.dimensions FROM rag.index_state s
-        JOIN rag.index_revisions r ON r.id=s.active_revision_id WHERE s.singleton=true AND r.state='active'""").fetchone()
-    if not row:
-        raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Index unavailable")
-    return row
-
-
-def _dense(conn, team_id: UUID, revision: dict, vector: list[float]) -> list[dict]:
-    dimension = int(revision["dimensions"])
-    if not 1 <= dimension <= 4096:
-        raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Index configuration invalid")
-    query = f"""SELECT c.id,c.document_id,c.version_id,c.content,c.source_locator,d.title,
-        e.embedding::vector({dimension}) <=> %s::vector({dimension}) AS distance
-        FROM rag.embeddings e JOIN rag.chunks c ON c.id=e.chunk_id
-        JOIN rag.documents d ON d.id=c.document_id
-        WHERE e.revision_id=%s AND {VISIBLE}
-        ORDER BY e.embedding::vector({dimension}) <=> %s::vector({dimension}), c.id LIMIT 50"""
-    literal = vector_literal(vector)
-    return conn.execute(query, (literal, revision["id"], team_id, literal)).fetchall()
-
-
-def _sparse(conn, team_id: UUID, query: str) -> list[dict]:
-    terms = sparse_terms(query)
-    if not terms:
-        return []
-    return conn.execute(f"""SELECT c.id,c.document_id,c.version_id,c.content,c.source_locator,d.title,
-        ts_rank_cd(c.search_vector,plainto_tsquery('simple',%s)) AS score
-        FROM rag.chunks c JOIN rag.documents d ON d.id=c.document_id
-        WHERE {VISIBLE} AND c.search_vector @@ plainto_tsquery('simple',%s)
-        ORDER BY score DESC,c.id LIMIT 50""", (terms, team_id, terms)).fetchall()
-
+from rag_service.computation import sparse_terms
+import asyncio
+from execution.persistence import resources, deadline
+from execution.scope import work_owner
 
 def _sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+async def search(request: EvidenceSearchRequest, run_id: str, tool_call_id: str, *, allocation=None) -> dict:
+    from execution.infra.http import fail_fast_pressure
+    marker = fail_fast_pressure.set(True)
+    from execution import tokens,delegation,timing
+    from uuid import uuid5,NAMESPACE_URL
+    identity=UUID(allocation['id']) if allocation else uuid4()
+    key=None
+    try:
+        existing=await delegation.start(identity,run_id,tool_call_id,request.model_dump(),allocation)
+        if existing is not None:return existing
+        key=tokens.budget_context.set({'id':str(identity),'kind':'search','run_id':run_id,'tool_call_id':tool_call_id,
+            'limit':allocation['limit'] if allocation else None,'expires_at':allocation['expires_at'] if allocation else None})
+        with timing.capture() as measured:
+            try:result=await _search(request,run_id,tool_call_id)
+            except BaseException as exc:
+                if not measured.get('audited'):
+                    try:
+                        await _audit('rag_failed_'+uuid4().hex,run_id,tool_call_id,None,'unavailable',[],operation='search',
+                            error_code=type(exc).__name__,candidate_trace={'version':2,'timing':timing.snapshot(),'stages':measured.get('stages',{})})
+                    except BaseException:
+                        import logging
+                        logging.getLogger(__name__).warning('Interrupted retrieval audit incomplete')
+                if isinstance(exc,(ApiError,ModelFailure,tokens.TokenBudgetExceeded)):
+                    await delegation.finish(identity,{'usage':await tokens.report(identity),'error_type':type(exc).__name__},status='failed')
+                raise
+        result['usage']=await tokens.report(identity)
+        await delegation.finish(identity,result)
+        return result
+    finally:
+        if key is not None:tokens.budget_context.reset(key)
+        fail_fast_pressure.reset(marker)
 
 
-def _audit(
-    request_id: str,
-    run_id: str,
-    tool_call_id: str,
-    team_id: UUID,
-    revision_id: UUID | None,
-    status: str,
-    degradations: list[str],
-    *,
-    operation: str,
-    evidence_id: UUID | None = None,
-    retrieval_id: str | None = None,
-    query_sha256: str | None = None,
-    rewritten_query_sha256: str | None = None,
-    selected_evidence_ids: list[str] | None = None,
-    error_code: str | None = None,
-    candidate_trace: dict | None = None,
-) -> None:
-    with connect("RAG_DATABASE_URL") as conn:
-        conn.execute("""INSERT INTO rag.retrieval_audit(
-            id,request_id,run_id,tool_call_id,team_id,revision_id,status,degradations,evidence_id,
-            operation,retrieval_id,query_sha256,rewritten_query_sha256,selected_evidence_ids,error_code,candidate_trace)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
-                uuid4(), request_id, run_id, tool_call_id, team_id, revision_id, status,
-                Jsonb(degradations), evidence_id, operation, retrieval_id, query_sha256,
-                rewritten_query_sha256,
-                Jsonb(selected_evidence_ids) if selected_evidence_ids is not None else None,
-                error_code,
-                Jsonb(candidate_trace) if candidate_trace is not None else None,
-            ))
-
-
-def _evidence(row: dict, rank: int | None = None) -> dict:
-    result = {"evidence_id": "ev_" + str(row["id"]), "document_id": "doc_" + str(row["document_id"]), "document_version_id": "ver_" + str(row["version_id"]), "title": row["title"], "content": row["content"], "source_locator": row["source_locator"]}
-    if rank is not None:
-        result["rank"] = rank
-    return result
-
-
-def search(request: EvidenceSearchRequest, team_id: UUID, run_id: str, tool_call_id: str) -> dict:
-    request_id, retrieval_id = "rag_req_" + uuid4().hex, "ret_" + uuid4().hex
+async def _search(request: EvidenceSearchRequest, run_id: str, tool_call_id: str) -> dict:
+    request_id, retrieval_id = ('rag_req_' + uuid4().hex, 'ret_' + uuid4().hex)
     degradations: list[str] = []
     query_sha256 = _sha256(request.query)
     rewritten_query_sha256 = query_sha256
-    stages = {name: {"status": "not_executed", "candidates": []}
-              for name in ("dense", "fts", "fusion", "rerank")}
-    stages["rewrite"] = {"status": "not_executed"}
-    stages["rerank"]["input_evidence_ids"] = []
-    candidate_trace = {"version": 1, "top_k": request.top_k, "stages": stages}
+    stages = {name: {'status': 'not_executed', 'candidates': []} for name in ('dense', 'fts', 'fusion', 'rerank')}
+    stages['rewrite'] = {'status': 'not_executed'}
+    stages['rerank']['input_evidence_ids'] = []
+    candidate_trace = {'version': 2, 'top_k': request.top_k, 'stages': stages}
+    from execution.timing import collector
+    collector.get()['stages']=stages
 
-    def audit(status: str, revision_id: UUID | None, selected: list[str], error_code: str | None = None) -> None:
-        _audit(
-            request_id,
-            run_id,
-            tool_call_id,
-            team_id,
-            revision_id,
-            status,
-            degradations,
-            operation="search",
-            retrieval_id=retrieval_id,
-            query_sha256=query_sha256,
-            rewritten_query_sha256=rewritten_query_sha256,
-            selected_evidence_ids=selected,
-            error_code=error_code,
-            candidate_trace=candidate_trace,
-        )
+    async def audit(status: str, revision_id: UUID | None, selected: list[str], error_code: str | None=None) -> None:
+        from execution.timing import snapshot
+        candidate_trace['timing']=snapshot()
+        collector.get()['audited']=True
+        await _audit(request_id, run_id, tool_call_id, revision_id, status, degradations, operation='search', retrieval_id=retrieval_id, query_sha256=query_sha256, rewritten_query_sha256=rewritten_query_sha256, selected_evidence_ids=selected, error_code=error_code, candidate_trace=candidate_trace)
+    try:
+        from execution.timing import span
+        with span('index_read'):revision = await retrieval_store.revision()
+    except ApiError:
+        await audit('unavailable', None, [], 'INDEX_UNAVAILABLE')
+        raise
 
+    async def prepare_vector():
+        nonlocal rewritten_query_sha256
+        try:
+            with span('rewrite'):dense_query = await rewrite(request.query)
+            rewritten_query_sha256 = _sha256(dense_query)
+            stages['rewrite']['status'] = 'success'
+        except ModelFailure as exc:
+            stages['rewrite']['error_code'] = exc.code
+            dense_query = request.query
+            degradations.append('QUERY_REWRITE_FALLBACK')
+            stages['rewrite']['status'] = 'unavailable'
+        try:
+            with span('embedding'):
+                return (await embed([f'Instruct: Given a user question, retrieve relevant passages that answer the question\nQuery: {dense_query}'], revision['model'], revision['dimensions']))[0]
+        except ModelFailure as exc:
+            stages['dense']['status'] = 'unavailable'
+            stages['dense']['error_code'] = exc.code
+            if not exc.retryable and exc.code not in ('TOKEN_BUDGET_EXHAUSTED','EMBEDDING_INPUT_TOO_LARGE'):
+                await audit('unavailable', revision['id'], [], exc.code)
+                raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, 'Embedding configuration unavailable') from exc
+            return None
+
+    async def prepare_terms():
+        with span('sparse_prepare'):
+            return await resources().cpu.run(sparse_terms, request.query, owner=work_owner(), deadline=deadline(120))
     try:
-        with connect("RAG_DATABASE_URL") as conn:
-            revision = _revision(conn)
+        async with asyncio.TaskGroup() as group:
+            dense_task = group.create_task(prepare_vector())
+            sparse_task = group.create_task(prepare_terms())
+    except ExceptionGroup as exc:
+        from execution.errors import select_failure
+        raise select_failure(exc) from exc
+    try:
+        with span('recall_transaction'):
+            snapshot = await retrieval_store.recall(revision, dense_task.result(), sparse_task.result())
     except ApiError:
-        audit("unavailable", None, [], "INDEX_UNAVAILABLE")
+        await audit('unavailable', revision['id'], [], 'INDEX_CONFIGURATION_INVALID')
         raise
-    try:
-        dense_query = rewrite(request.query)
-        rewritten_query_sha256 = _sha256(dense_query)
-        stages["rewrite"]["status"] = "success"
-    except ModelFailure:
-        dense_query = request.query
-        degradations.append("QUERY_REWRITE_FALLBACK")
-        stages["rewrite"]["status"] = "unavailable"
-    try:
-        vector = embed([f"Instruct: Given a user question, retrieve relevant passages that answer the question\nQuery: {dense_query}"], revision["model"], revision["dimensions"])[0]
-        with connect("RAG_DATABASE_URL") as conn:
-            dense = _dense(conn, team_id, revision, vector)
-        stages["dense"] = {"status": "success", "candidates": [
-            {"evidence_id": "ev_" + str(row["id"]), "rank": rank, "distance": row["distance"]}
-            for rank, row in enumerate(dense, 1)]}
-    except ModelFailure as exc:
-        stages["dense"]["status"] = "unavailable"
-        if not exc.retryable:
-            audit("unavailable", revision["id"], [], exc.code)
-            raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Embedding configuration unavailable") from exc
-        dense = None
-        degradations.append("DENSE_UNAVAILABLE")
-    except ApiError:
-        stages["dense"]["status"] = "unavailable"
-        audit("unavailable", revision["id"], [], "INDEX_CONFIGURATION_INVALID")
-        raise
-    except psycopg.OperationalError:
-        stages["dense"]["status"] = "unavailable"
-        dense = None
-        degradations.append("DENSE_UNAVAILABLE")
-    try:
-        with connect("RAG_DATABASE_URL") as conn:
-            sparse = _sparse(conn, team_id, request.query)
-        stages["fts"] = {"status": "success", "candidates": [
-            {"evidence_id": "ev_" + str(row["id"]), "rank": rank, "score": row["score"]}
-            for rank, row in enumerate(sparse, 1)]}
-    except psycopg.OperationalError:
-        stages["fts"]["status"] = "unavailable"
-        sparse = None
-        degradations.append("FTS_UNAVAILABLE")
+    revision, dense, sparse = snapshot.revision, snapshot.dense, snapshot.sparse
+    for name, results, metric, code in (
+        ('dense', dense, 'distance', 'DENSE_UNAVAILABLE'),
+        ('fts', sparse, 'score', 'FTS_UNAVAILABLE'),
+    ):
+        if results is None:
+            stages[name]['status'] = 'unavailable'
+            degradations.append(code)
+        else:
+            stages[name] = {'status': 'success', 'candidates': [
+                {'evidence_id': 'ev_' + str(row['id']), 'rank': rank, metric: row[metric]}
+                for rank, row in enumerate(results, 1)]}
     if dense is None and sparse is None:
-        audit("unavailable", revision["id"], [], "RETRIEVAL_UNAVAILABLE")
-        raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Retrieval unavailable")
-    scores: dict[UUID, float] = {}
-    rows: dict[UUID, dict] = {}
-    for results in (dense or [], sparse or []):
-        for rank, row in enumerate(results, 1):
-            rows[row["id"]] = row
-            scores[row["id"]] = scores.get(row["id"], 0) + 1 / (60 + rank)
-    fused = sorted(rows, key=lambda item: (-scores[item], str(item)))
-    stages["fusion"] = {"status": "success", "candidates": [
-        {"evidence_id": "ev_" + str(item), "rank": rank, "rrf_score": scores[item]}
-        for rank, item in enumerate(fused, 1)]}
+        await audit('unavailable', revision['id'], [], 'RETRIEVAL_UNAVAILABLE')
+        raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, 'Retrieval unavailable')
+    with span('fusion'):
+        scores: dict[UUID, float] = {}
+        rows: dict[UUID, dict] = {}
+        for results in (dense or [], sparse or []):
+            for rank, row in enumerate(results, 1):
+                rows[row['id']] = row
+                scores[row['id']] = scores.get(row['id'], 0) + 1 / (60 + rank)
+        fused = sorted(rows, key=lambda item: (-scores[item], str(item)))
+        stages['fusion'] = {'status': 'success', 'candidates': [{'evidence_id': 'ev_' + str(item), 'rank': rank, 'rrf_score': scores[item]} for rank, item in enumerate(fused, 1)]}
     ordered = fused[:40]
     if ordered:
-        stages["rerank"]["input_evidence_ids"] = ["ev_" + str(item) for item in ordered]
+        stages['rerank']['input_evidence_ids'] = ['ev_' + str(item) for item in ordered]
         try:
-            ranked = rerank(request.query, [rows[item]["content"] for item in ordered])
-            stages["rerank"]["status"] = "success"
-            stages["rerank"]["candidates"] = [
-                {"evidence_id": "ev_" + str(ordered[item["index"]]), "rank": rank, "score": item["score"]}
-                for rank, item in enumerate(ranked, 1)]
-            ordered = [ordered[item["index"]] for item in ranked]
+            with span('rerank'):ranked = await rerank(request.query, [rows[item]['content'] for item in ordered])
+            stages['rerank']['status'] = 'success'
+            stages['rerank']['candidates'] = [{'evidence_id': 'ev_' + str(ordered[item['index']]), 'rank': rank, 'score': item['score']} for rank, item in enumerate(ranked, 1)]
+            ordered = [ordered[item['index']] for item in ranked]
         except ModelFailure as exc:
-            stages["rerank"]["status"] = "unavailable"
-            if not exc.retryable:
-                audit("unavailable", revision["id"], [], exc.code)
-                raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, "Reranker configuration unavailable") from exc
-            degradations.append("RERANK_UNAVAILABLE")
-    selected = [_evidence(rows[item], rank) for rank, item in enumerate(ordered[:request.top_k], 1)]
-    status = "no_hits" if not selected else "degraded" if degradations else "ok"
-    audit(status, revision["id"], [item["evidence_id"] for item in selected])
-    return {"request_id": request_id, "retrieval_id": retrieval_id, "status": status, "evidences": selected, "degradations": degradations}
-
-
-def read_evidence(evidence_id: str, team_id: UUID, run_id: str, tool_call_id: str) -> dict:
-    request_id = "rag_req_" + uuid4().hex
-    try:
-        chunk_id = UUID(evidence_id.removeprefix("ev_")) if evidence_id.startswith("ev_") else None
-    except ValueError:
-        chunk_id = None
-    with connect("RAG_DATABASE_URL") as conn:
-        state = conn.execute("SELECT active_revision_id FROM rag.index_state WHERE singleton=true").fetchone()
-        row = conn.execute(f"""SELECT c.id,c.document_id,c.version_id,c.content,c.source_locator,d.title
-            FROM rag.chunks c JOIN rag.documents d ON d.id=c.document_id
-            WHERE c.id=%s AND {VISIBLE_HISTORY}""", (chunk_id, team_id)).fetchone() if chunk_id else None
-    _audit(
-        request_id,
-        run_id,
-        tool_call_id,
-        team_id,
-        state["active_revision_id"] if state else None,
-        "read_ok" if row else "not_found",
-        [],
-        operation="read",
-        evidence_id=chunk_id,
-        selected_evidence_ids=["ev_" + str(chunk_id)] if row else [],
-        error_code=None if row else "EVIDENCE_NOT_FOUND",
-    )
-    if not row:
-        raise ApiError(404, ErrorCode.NOT_FOUND, "Evidence not found")
-    return _evidence(row)
+            stages['rerank']['status'] = 'unavailable'
+            stages['rerank']['error_code'] = exc.code
+            if not exc.retryable and exc.code not in ('TOKEN_BUDGET_EXHAUSTED','RERANK_INPUT_TOO_LARGE'):
+                await audit('unavailable', revision['id'], [], exc.code)
+                raise ApiError(503, ErrorCode.RAG_UNAVAILABLE, 'Reranker configuration unavailable') from exc
+            degradations.append('RERANK_UNAVAILABLE')
+    order=['QUERY_REWRITE_FALLBACK','DENSE_UNAVAILABLE','FTS_UNAVAILABLE','RERANK_UNAVAILABLE']
+    degradations[:]=[code for code in order if code in degradations]
+    with span('response_assembly'):
+        selected = [_evidence(rows[item], rank) for rank, item in enumerate(ordered[:request.top_k], 1)]
+    status = 'no_hits' if not selected else 'degraded' if degradations else 'ok'
+    await audit(status, revision['id'], [item['evidence_id'] for item in selected])
+    return {'request_id': request_id, 'retrieval_id': retrieval_id, 'status': status, 'evidences': selected, 'degradations': degradations}
