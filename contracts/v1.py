@@ -27,7 +27,6 @@ class ErrorCode(StrEnum):
     TOOL_CALL_FAILED = "TOOL_CALL_FAILED"
     INVALID_PLAN = "INVALID_PLAN"
     AUTH_FAILED = "AUTH_FAILED"
-    ACCESS_DENIED = "ACCESS_DENIED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
     INTERRUPTED_UNKNOWN = "INTERRUPTED_UNKNOWN"
     CONVERSATION_BUSY = "CONVERSATION_BUSY"
@@ -41,6 +40,7 @@ class ErrorDetail(StrictModel):
 class ErrorResponse(StrictModel):
     error: ErrorDetail
     request_id: str
+
 
 
 class RunCreate(StrictModel):
@@ -67,17 +67,8 @@ class RunListItem(StrictModel):
     error_code: str | None
 
 
-class AdminRunListItem(RunListItem):
-    team_id: UUID
-
-
 class RunList(StrictModel):
     items: list[RunListItem]
-    next_cursor: str | None
-
-
-class AdminRunList(StrictModel):
-    items: list[AdminRunListItem]
     next_cursor: str | None
 
 
@@ -88,6 +79,10 @@ class RunQueueSummary(StrictModel):
     running_lease_expired: int
     cancelling: int
     oldest_claimable_created_at: datetime | None
+
+
+
+
 
 
 class WorkerInstanceStatus(StrictModel):
@@ -161,6 +156,8 @@ class EvidenceSearchRequest(StrictModel):
     top_k: int = Field(default=5, ge=1, le=20)
 
 
+
+
 class EvidenceSearchResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
     request_id: str
@@ -182,12 +179,6 @@ class DocumentVersionStatus(DocumentVersionRef):
     warnings: list[str]
 
 
-class DocumentAccess(StrictModel):
-    document_id: str
-    visibility: Literal["public", "restricted"]
-    team_ids: list[str]
-
-
 class DocumentDeleted(StrictModel):
     document_id: str
     deleted_at: datetime
@@ -198,6 +189,9 @@ class Claim(StrictModel):
     support: Literal["evidence", "unverified"]
     evidence_ids: list[str]
     reason: str | None = None
+
+
+
 
 
 class Result(StrictModel):

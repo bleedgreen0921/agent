@@ -22,6 +22,10 @@ def with_agent_search_path(dsn: str, *, runtime: bool = False) -> str:
 
 
 def main() -> None:
+    import psycopg
+    from db.migrate import validate_database
+    with psycopg.connect(os.environ["MIGRATION_DATABASE_URL"]) as conn:
+        validate_database(conn)
     with PostgresSaver.from_conn_string(with_agent_search_path(os.environ["MIGRATION_DATABASE_URL"])) as saver:
         saver.setup()
 

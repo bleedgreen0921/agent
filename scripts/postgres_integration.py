@@ -21,19 +21,19 @@ def test_environment(base: dict, port: int, files: Path) -> dict:
     """Override inherited production DSNs and model settings in child processes only."""
     env = dict(base)
     for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_MODEL_KEY", "AGENT_EXPERIMENT_ROOT",
-                 "AGENT_EXPERIMENT_TEAM_ID", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
+                 "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
         env.pop(name, None)
     for variable, user in (("MIGRATION_DATABASE_URL", "postgres"), ("AGENT_DATABASE_URL", "agent_runtime"),
-                           ("RAG_DATABASE_URL", "rag_runtime"), ("IDENTITY_ADMIN_DATABASE_URL", "identity_admin")):
+                           ("RAG_DATABASE_URL", "rag_runtime")):
         password = env["POSTGRES_INTEGRATION_PASSWORD"] if user == "postgres" else secrets.token_hex(24)
         env[variable] = f"postgresql://{user}:{password}@127.0.0.1:{port}/{DATABASE}?connect_timeout=3"
-    env.update({"RAG_FILES_DIR": str(files), "RAG_SERVICE_TOKEN": secrets.token_urlsafe(32),
+    env.update({"RAG_FILES_DIR": str(files), "CALL_ARCHIVE_DIR":str(files.parent/'call-archives'), "RAG_SERVICE_TOKEN": secrets.token_urlsafe(32),
                 "AGENT_TOOL_PROVIDERS": "agent_service.tools.rag:tools",
                 "AGENT_MODEL": "synthetic-scripted", "AGENT_MODEL_URL": "http://127.0.0.1:9",
                 "RAG_BASE_URL": "http://127.0.0.1:9", "RAG_EMBEDDING_URL": "http://127.0.0.1:9",
                 "RAG_REWRITE_URL": "", "RAG_RERANK_URL": "", "AGENT_EMBEDDING_URL": "",
                 "APP_REVISION": "local-synthetic-integration", "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1", "PYTHONUNBUFFERED": "1"})
+                "TRANSFORMERS_OFFLINE": "1", "PERSONAL_TEST_DATABASE": "1", "PYTHONUNBUFFERED": "1"})
     return env
 
 

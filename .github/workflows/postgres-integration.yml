@@ -26,7 +26,7 @@ jobs:
       MIGRATION_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/research_agent
       RAG_DATABASE_URL: postgresql://rag_runtime:rag-runtime-ci@127.0.0.1:5432/research_agent
       AGENT_DATABASE_URL: postgresql://agent_runtime:agent-runtime-ci@127.0.0.1:5432/research_agent
-      IDENTITY_ADMIN_DATABASE_URL: postgresql://identity_admin:identity-admin-ci@127.0.0.1:5432/research_agent
+      PERSONAL_TEST_DATABASE: "1"
       RAG_SERVICE_TOKEN: ci-only-service-token-with-at-least-32-bytes
       RAG_FILES_DIR: ${{ runner.temp }}/rag-files
       APP_REVISION: ${{ github.sha }}
