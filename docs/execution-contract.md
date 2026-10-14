@@ -6,6 +6,7 @@ This release is one personal instance. It has no user, team, credential or ACL d
 
 A write or external call requires the correct task kind and ID, matching token, running status, unexpired lease and unexpired total deadline. The task is locked in the write transaction using database `clock_timestamp()`, then checked again immediately before finishing the transaction. A heartbeat cannot resurrect an expired lease. Long RAG bulk writes lock the task at the end to let the parent renew during preparation. Checkpoint, blob and intermediate writes use the same protected connection/transaction.
 
+Candidate selection never grants authority by itself: claim rechecks availability, queue expiry and any existing execution deadline using a fresh sample after the row lock. Creation, first claim and renewal use one sampled time for their related fields; recovery validation is followed by a new deadline check. Reports share an observation cutoff and do not grant execution permission. See [database time rules](database-time.md).
 
 Priority: existing terminal state; mismatched token; submitted cancellation; total deadline; ordinary failure/recovery. A displaced executor never changes its successor. Reservations are not refunded. Unknown external results are never replayed. Agent recovery requires all calls settled and explicitly checkpointed; final generation stays outside the graph.
 

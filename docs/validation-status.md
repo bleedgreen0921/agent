@@ -139,6 +139,20 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 报告：`.data/postgres-integration/rap-test-946ffd82d065/`。
 结果：356 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor 与三个实验数据库专项通过；隔离容器已清理，未操作个人数据库。无需 schema 迁移。git diff --check 与相关模块编译检查通过。
 
+## PostgreSQL 时间语义复核与修复
+
+2026-10-13 全面检查生产 SQL 中 now()、clock_timestamp()、statement_timestamp() 及历史默认值。租约、执行权、最终发布已有锁后实际时间保护；本轮修复 Worker 心跳的事务开始时间、文档删除的锁前表达式求值、调用开始和 Manifest 捕获的默认事务时间，以及监控／doctor 的旧时间和队列汇总跨查询阈值漂移。普通记录的事务创建时间默认值保留，关键事件显式覆盖历史默认值。规则及保留原因见 [database-time.md](database-time.md)。
+
+任务创建、首次认领、续租用单次实际时间采样统一相关时间字段。候选查询只负责筛选，认领 UPDATE 在目标行已锁定后采样新的时间，复查可用时间、排队期限和既有执行期限；超期不分配新 token 或增加 attempts。恢复回执验证后重查期限；恢复和可重试失败的排队 UPDATE 均再次要求期限有效，超期按三类任务各自的超时错误结算。恢复保留首次开始时间、期限和预算。
+
+新增 25 项专用 PostgreSQL 测试：六种事件的真实锁等待与锁释放后时间；三类任务分别在排队期限／执行期限跨界时拒绝认领；恢复验证期间跨界；三类任务创建／认领／续租字段的共同时间基准和期限保持；两个 Worker 状态报告的实际采样和共用阈值；三类 doctor 在旧事务里识别新过期租约；队列汇总跨过期限后仍使用同一观察阈值；三类可重试失败在更新前跨过期限时结算为超时。使用 pg_blocking_pids、事件屏障及 pg_sleep_until 的数据库期限，避免仅靠客户端猜测延时。
+
+最终验收：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55454`。
+报告：`.data/postgres-integration/rap-test-48d54160f8f5/`。
+结果：381 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor、三个实验数据库专项和既有执行权／召回快照测试通过；相关模块 compileall、AST 和 git diff --check 通过。专用容器已清理，未操作个人数据库，无新增 schema 迁移。
+
+报告共用时间阈值与数据快照一致性保持区分：监控数据仍是 READ COMMITTED 的观察，不作为执行权；RAG 双路使用原只读 REPEATABLE READ。数据库实际时间仍取服务器墙钟；本地容量、调用和退出预算继续使用单调时钟。
+
 ## R01 专项复核：结算、checkpoint 确认与控制语义
 
 2026-10-13 复核确认 R01 所列 now()、UPDATE FROM 代替任务锁、control_state 不读取租约或使用应用时钟的旧实现，已不在当前运行路径中。当前模型／工具结算先锁任务行，再锁调用行，写入前后使用 assert_active；fail_run 经过统一的锁后失败结算；批量 mark_checkpointed_calls 已删除。Saver 的主记录、blob、pending write 和回执一直在同一受保护事务中提交。
