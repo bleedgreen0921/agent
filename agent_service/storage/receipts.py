@@ -31,6 +31,11 @@ def markers(value):
 
 async def confirm(conn, run_id, token, calls, *, source, thread, ns, checkpoint_id,
                   channel, digest, graph_task_id='', write_idx=-1):
+    # A transaction primitive must protect its own writes, even when called
+    # outside ProtectedSaver. It uses the caller's transaction so the real
+    # graph output and receipts still commit or roll back together.
+    task = TaskRef(run_id, TaskKind.AGENT)
+    await store.assert_active(conn, task, token)
     for kind, call_id in set(calls):
         table = 'model_calls' if kind == 'model' else 'tool_calls'
         call = await (await conn.execute(f'SELECT status,attempt_token,step_id FROM agent.{table} WHERE run_id=%s AND id=%s', (run_id,call_id))).fetchone()
@@ -63,6 +68,7 @@ async def confirm(conn, run_id, token, calls, *, source, thread, ns, checkpoint_
             if not old:
                 raise PermissionError('Old call has no durable recovery proof')
         await conn.execute(f'UPDATE agent.{table} SET checkpointed=true WHERE run_id=%s AND id=%s', (run_id,call_id))
+    await store.assert_active(conn, task, token)
 
 
 def anchor_query(r):

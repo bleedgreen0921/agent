@@ -52,9 +52,10 @@ def main() -> None:
         # rest of the Agent schema follows the normal CRUD default privileges.
         conn.execute("REVOKE UPDATE, DELETE ON agent.run_manifests FROM agent_runtime")
         conn.execute("GRANT SELECT, INSERT ON agent.run_manifests TO agent_runtime")
-        for table in ("call_checkpoint_receipts", "conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots", "run_experiment_snapshots"):
+        for table in ("call_checkpoint_receipts", "run_results", "result_claims", "evidence_snapshots", "claim_evidence", "conversation_turns", "conversation_summaries", "personal_facts", "run_memory_snapshots", "run_experiment_snapshots"):
             conn.execute(sql.SQL("REVOKE UPDATE, DELETE ON agent.{} FROM agent_runtime").format(sql.Identifier(table)))
             conn.execute(sql.SQL("GRANT SELECT, INSERT ON agent.{} TO agent_runtime").format(sql.Identifier(table)))
+        conn.execute("REVOKE DELETE ON agent.checkpoints,agent.checkpoint_blobs,agent.checkpoint_writes FROM agent_runtime")
         conn.execute("REVOKE ALL ON execution.alembic_version, rag.alembic_version, agent.alembic_version FROM rag_runtime, agent_runtime")
 
 

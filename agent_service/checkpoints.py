@@ -72,8 +72,10 @@ class ProtectedSaver(AsyncPostgresSaver):
     async def _cursor(self, *, pipeline=False):
         async with transaction('AGENT_DATABASE_URL') as conn:
             await conn.execute('SET LOCAL search_path=agent')
+            await store.assert_active(conn,self.task,self.token)
             async with conn.cursor(binary=True,row_factory=dict_row) as cur:
                 yield cur
+            await store.assert_active(conn,self.task,self.token)
 
     async def _data(self, fn, *args):
         return await resources().io.run(fn,*args,owner=self.owner,deadline=deadline())
@@ -90,6 +92,7 @@ class ProtectedSaver(AsyncPostgresSaver):
         meta=get_serializable_checkpoint_metadata(config,metadata)
         async with transaction('AGENT_DATABASE_URL') as conn:
             await conn.execute('SET LOCAL search_path=agent')
+            await store.assert_active(conn,self.task,self.token)
             async with conn.cursor(binary=True,row_factory=dict_row) as cur:
                 if params: await cur.executemany(self.UPSERT_CHECKPOINT_BLOBS_SQL,params)
                 for blob in params:
@@ -104,6 +107,7 @@ class ProtectedSaver(AsyncPostgresSaver):
                 row=await (await conn.execute("SELECT sha256(convert_to(c.checkpoint::text,'UTF8')||convert_to(b.type,'UTF8')||b.blob) AS digest FROM agent.checkpoints c JOIN agent.checkpoint_blobs b ON b.thread_id=c.thread_id AND b.checkpoint_ns=c.checkpoint_ns AND b.channel=%s AND b.version=c.checkpoint->'channel_versions'->>%s WHERE c.thread_id=%s AND c.checkpoint_ns=%s AND c.checkpoint_id=%s",(channel,channel,thread,ns,cp))).fetchone()
                 if not row: raise ValueError('Checkpoint output was not persisted')
                 await confirm(conn,self.task.id,self.token,calls,source='checkpoint',thread=thread,ns=ns,checkpoint_id=cp,channel=channel,digest=row['digest'])
+            await store.assert_active(conn,self.task,self.token)
         return {'configurable':{'thread_id':thread,'checkpoint_ns':ns,'checkpoint_id':cp}}
 
     async def aput_writes(self,config,writes,task_id,task_path=''):
@@ -113,6 +117,7 @@ class ProtectedSaver(AsyncPostgresSaver):
         query=self.UPSERT_CHECKPOINT_WRITES_SQL if all(w[0] in WRITES_IDX_MAP for w in writes) else self.INSERT_CHECKPOINT_WRITES_SQL
         async with transaction('AGENT_DATABASE_URL') as conn:
             await conn.execute('SET LOCAL search_path=agent')
+            await store.assert_active(conn,self.task,self.token)
             async with conn.cursor(binary=True,row_factory=dict_row) as cur:
                 await cur.executemany(query,params)
             for index,(channel,value) in enumerate(writes):
@@ -124,6 +129,7 @@ class ProtectedSaver(AsyncPostgresSaver):
                 if not row or row['type']!=submitted[-2] or bytes(row['blob'])!=bytes(submitted[-1]):
                     raise ValueError('Pending write conflict')
                 await confirm(conn,self.task.id,self.token,calls,source='pending_write',thread=thread,ns=ns,checkpoint_id=cp,channel=channel,digest=row['digest'],graph_task_id=task_id,write_idx=index)
+            await store.assert_active(conn,self.task,self.token)
 
     def _decode(self,value):
         if value['checkpoint']['v']<4: raise ValueError('Historical checkpoint execution is unsupported')

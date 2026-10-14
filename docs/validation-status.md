@@ -116,3 +116,27 @@ JUnit、pytest 日志、doctor 报告和 summary.json 位于上述被 gitignore 
 全量测试和冒烟分别使用隔离数据库；没有访问真实模型或正在使用的个人数据库。测试数据库在验证结束后清理。发布继续沿用排空并停止 Worker、更新代码、启动验收的流程，详见 [调用适配说明](call-adapters.md)。
 
 最终边界检查补齐 CPU 模型本地加载：tokenizer 禁止远程元数据请求，PDF 向 Docling 传入本地 artifacts，CPU 子进程使用 HF／Transformers 离线模式。OCR 与表格处理保持开启；PDF 模型缓存需在部署准备时提供。
+
+## 执行权专项复核：过期续租与最终发布
+
+2026-10-13 复核确认当前实现已在任务行锁取得后单独读取 clock_timestamp()，检查任务身份、token、running、停止请求、旧租约和执行总期限。续租 UPDATE 再要求旧租约与总期限有效；最终发布经 store.complete 在产物写入后复查，拒绝时整体回滚。已有结果返回 AlreadyApplied 属于幂等核实，不构成新的发布。本轮未改写生产执行逻辑，仅补充锁后时钟校验注释和数据库回归测试。
+
+新增六项真实 PostgreSQL 测试：续租／发布分别在等待行锁期间跨过租约或总期限，保持原 token、running、无停止请求且无人接管；观察 pg_blocking_pids 确认实际锁等待，以数据库时间确认过期后释放锁，验证拒绝续租／发布且心跳未更新。另在两种期限失效条件下，确认答案、claim、证据快照、引用关联和摘要任务已经写入当前事务，再验证最终复查令全部产物及关联任务回滚。
+
+验收命令：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55450`。
+报告：`.data/postgres-integration/rap-test-4ae43a521c99/`。
+结果：345 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor 与三个实验数据库专项通过；隔离容器已清理，没有操作正在使用的个人数据库。git diff --check 与相关模块编译检查通过。
+
+## R01 专项复核：结算、checkpoint 确认与控制语义
+
+2026-10-13 复核确认 R01 所列 now()、UPDATE FROM 代替任务锁、control_state 不读取租约或使用应用时钟的旧实现，已不在当前运行路径中。当前模型／工具结算先锁任务行，再锁调用行，写入前后使用 assert_active；fail_run 经过统一的锁后失败结算；批量 mark_checkpointed_calls 已删除。Saver 的主记录、blob、pending write 和回执一直在同一受保护事务中提交。
+
+本轮补齐回执确认原语自身的边界：receipts.confirm 在调用方事务内开始和结束都执行任务行锁及实际时间校验，不再只依赖 Saver 外层授权。持久写入、Agent control_state 与 Worker 控制循环的纯判断复用 LeaseSnapshot.refusal；stopping 即使没有停止时间字段也按取消处理，非 running 状态不能被报告为 running。失败结算拒绝旧 token 和非活动状态，保留取消／总期限控制结算及受限 Worker 退出规则；清扫停止状态也按取消结算。
+
+新增 41 项真实 PostgreSQL 测试：模型／工具结算、主 checkpoint、pending write、失败结算分别在任务行锁等待中交织取消、接管、租约过期和总期限过期（20 项）；直接调用确认原语的四种失权及两种写入后过期（6 项）；两种 Saver 写入在回执确认后跨过两种期限的图记录／回执／布尔标记整体回滚（4 项）；控制状态、持久授权、Worker 动作和失败结算九种优先级组合；两类调用的 AlreadyApplied 核实不更新已有数据、不赋予执行权（2 项）。锁竞争通过 pg_blocking_pids 和事件屏障确认，期限通过数据库实际时间验证。
+
+本轮统一的是执行契约，不将控制观察当作写入授权。失败／中断结算属于控制操作，可按同一 token 处理已取消或总期限过期任务；业务调用结算与 checkpoint 写入继续要求有效租约和期限。AlreadyApplied 仅核实已有相同结果；恢复仍检查真实图记录和回执。
+
+最终验收：`.venv/bin/python -m scripts.postgres_integration --suite full --port 55455`。
+报告：`.data/postgres-integration/rap-test-c0941cad2f5d/`。
+结果：422 通过，0 失败、0 错误、0 跳过；原有 33 条依赖警告不变。doctor 与三个实验数据库专项通过；相关模块 compileall、git diff --check 通过。专用容器已清理，未操作个人数据库，无新增 schema 迁移。契约说明见 [execution-contract.md](execution-contract.md)。
